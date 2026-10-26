@@ -38,6 +38,8 @@ jobs:
       - name: test
         env:
           HOSTIG_MARIADB_IT_CACHE: ${{ runner.temp }}/hostig-mariadb-it-cache
+          # Solo tests: permite MariaDB/supervisor si el job del runner niega breakaway (ADR 0011).
+          HOSTIG_ALLOW_JOB_WITHOUT_BREAKAWAY: "1"
         run: cargo test --workspace
 
   frontend:

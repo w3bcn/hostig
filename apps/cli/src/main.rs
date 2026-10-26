@@ -659,15 +659,18 @@ fn spawn_detached(bin: &std::path::Path) -> std::io::Result<std::process::Child>
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
+        return command.spawn();
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        // Misma política ADR 0011 que MariaDB: breakaway, y si falla consultar kill-on-close.
+        hostig_processes::spawn_detached_windows(&mut command).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{}: {} ({})", error.message, error.cause, error.action),
+            )
+        })
     }
-    command.spawn()
 }
 
 #[cfg(windows)]

@@ -6,17 +6,12 @@ use crate::error::{ProcessError, Result};
 use crate::mariadb::config::{write_admin_cnf, write_my_ini, InstancePaths};
 
 /// Localiza `bin/` del runtime MariaDB instalado (busca mariadbd.exe / mariadbd).
+/// No asume un nombre de carpeta de versión fijo: prueba `bin/` en la raíz y un nivel.
 pub fn find_mariadb_bin(runtime_root: &Path) -> Result<PathBuf> {
-    let candidates = [
-        runtime_root.join("bin"),
-        runtime_root.join("mariadb-11.4.13-winx64").join("bin"),
-    ];
-    for dir in &candidates {
-        if exe_in(dir, "mariadbd").is_some() {
-            return Ok(dir.clone());
-        }
+    let direct = runtime_root.join("bin");
+    if exe_in(&direct, "mariadbd").is_some() {
+        return Ok(direct);
     }
-    // Búsqueda superficial.
     if let Ok(entries) = fs::read_dir(runtime_root) {
         for entry in entries.flatten() {
             let bin = entry.path().join("bin");

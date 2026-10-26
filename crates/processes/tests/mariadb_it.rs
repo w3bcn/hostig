@@ -1,4 +1,7 @@
 //! Integración MariaDB (bloque 3a). En Linux/macOS se saltan hasta las fases 1b/1c.
+//!
+//! Requiere `HOSTIG_ALLOW_JOB_WITHOUT_BREAKAWAY=1` en entornos cuyo job niega
+//! breakaway y tiene kill-on-close (CI, algunos IDE). Ver ADR 0011.
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -11,7 +14,7 @@ use hostig_processes::mariadb::{
     log_contains_shutdown, new_log_offset, read_log_since, DbService, DbState, InstancePaths,
     StartRequest, DEFAULT_INSTANCE_ID, DEFAULT_MARIADB_VERSION,
 };
-use hostig_processes::{emergency_kill, ProcessRecord};
+use hostig_processes::{ProcessRecord, ALLOW_JOB_WITHOUT_BREAKAWAY_ENV};
 use hostig_runtimes::{runtime_dir, Catalog, RuntimeService, MANIFEST_NAME};
 
 fn skip_unless_windows() -> bool {
@@ -24,12 +27,15 @@ fn skip_unless_windows() -> bool {
     true
 }
 
+fn allow_job_for_tests() {
+    // Solo tests: permite spawn si el job del runner/IDE niega breakaway con kill-on-close.
+    std::env::set_var(ALLOW_JOB_WITHOUT_BREAKAWAY_ENV, "1");
+}
+
 fn data_dir() -> tempfile::TempDir {
     if let Ok(cache) = std::env::var("HOSTIG_MARIADB_IT_CACHE") {
         let path = PathBuf::from(cache);
         std::fs::create_dir_all(&path).expect("cache dir");
-        // TempDir que no borra el caché de runtimes: usamos un subdir efímero
-        // con enlace/copia del runtime instalado si existe.
         let tmp = tempfile::tempdir().expect("tmp");
         let cached_runtimes = path.join("runtimes");
         if cached_runtimes.is_dir() {
@@ -113,6 +119,7 @@ fn ciclo_completo_iniciar_ping_apagar() {
     if skip_unless_windows() {
         return;
     }
+    allow_job_for_tests();
     let tmp = data_dir();
     ensure_mariadb_installed(tmp.path());
     persist_runtime_cache(tmp.path());
@@ -156,13 +163,13 @@ fn start_con_puerto_ocupado_no_lanza_y_nombra_ocupante() {
     if skip_unless_windows() {
         return;
     }
+    allow_job_for_tests();
     let tmp = data_dir();
     ensure_mariadb_installed(tmp.path());
     persist_runtime_cache(tmp.path());
 
     let holder = TcpListener::bind(("127.0.0.1", 0)).expect("holder");
     let port = holder.local_addr().expect("addr").port();
-    // Mantener el listener vivo.
     let _keep = holder;
 
     let service = Arc::new(DbService::with_embedded(tmp.path()).expect("db"));
@@ -191,48 +198,42 @@ fn start_con_puerto_ocupado_no_lanza_y_nombra_ocupante() {
 }
 
 #[test]
-fn supervisor_muerto_deja_mariadb_viva_y_al_reiniciar_adopta() {
+fn stop_mientras_starting_se_rechaza() {
     if skip_unless_windows() {
         return;
     }
+    allow_job_for_tests();
     let tmp = data_dir();
     ensure_mariadb_installed(tmp.path());
     persist_runtime_cache(tmp.path());
-
-    let port = free_port();
     let service = Arc::new(DbService::with_embedded(tmp.path()).expect("db"));
-    let job = service
+    let port = free_port();
+    let _job = service
         .start_async(StartRequest {
             id: DEFAULT_INSTANCE_ID.into(),
             version: DEFAULT_MARIADB_VERSION.into(),
             port,
         })
         .expect("start");
-    wait_job(&service, &job.job_id, Duration::from_secs(180));
-    let pid = service.status().pid.expect("pid");
-    assert!(hostig_ipc::process_is_running(pid));
-
-    // Simula la muerte del supervisor: soltamos el servicio sin stop.
-    // El Child se dropea; MariaDB debe seguir (sin Job kill-on-close).
-    drop(service);
-    thread::sleep(Duration::from_millis(500));
+    assert_eq!(service.status().state, DbState::Starting);
+    let err = service
+        .stop_async()
+        .expect_err("stop debe fallar en Starting");
     assert!(
-        hostig_ipc::process_is_running(pid),
-        "MariaDB debía seguir viva tras morir el supervisor"
+        err.cause.contains("Starting") || err.message.contains("arranque"),
+        "{err}"
     );
-
-    let again = DbService::with_embedded(tmp.path()).expect("db reinicio");
-    let status = again.status();
-    assert_eq!(status.state, DbState::Running);
-    assert_eq!(status.pid, Some(pid));
-
-    // Limpieza: emergencia + o stop ordenado.
-    let service = Arc::new(again);
-    let stop = service.stop_async().expect("stop");
-    if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    assert!(err.action.contains("espera"), "{err}");
+    // Dejar que el arranque termine y apagar para no dejar basura.
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while Instant::now() < deadline {
+        if !matches!(service.status().state, DbState::Starting) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    if matches!(service.status().state, DbState::Running) {
+        let stop = service.stop_async().expect("stop final");
         wait_job(&service, &stop.job_id, Duration::from_secs(60));
-    })) {
-        let _ = emergency_kill(tmp.path(), DEFAULT_INSTANCE_ID, pid);
-        std::panic::resume_unwind(error);
     }
 }

@@ -441,9 +441,13 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "hostig-ipc",
+ "hostig-ports",
+ "hostig-processes",
+ "hostig-runtimes",
  "hostig-supervisor",
  "serde_json",
  "tempfile",
+ "windows",
 ]
 
 [[package]]

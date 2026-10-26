@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::error::{ProcessError, Result};
+use crate::job::{decide_after_breakaway_denied, BreakawayFallback};
 use crate::registry::{now_unix_ms, ProcessRecord};
 
 /// Especificación para lanzar un servidor (MariaDB, PHP, Apache).
@@ -80,9 +81,9 @@ pub fn spawn_server(spec: &SpawnSpec) -> Result<SpawnedProcess> {
     Ok(SpawnedProcess { record, child })
 }
 
-/// Windows: intenta `CREATE_BREAKAWAY_FROM_JOB` (ADR 0011). Si el job padre lo
-/// deniega (ERROR_ACCESS_DENIED), reintenta sin ese flag para no bloquear CI/IDE;
-/// en ese caso MariaDB queda en el job padre (sin kill-on-close por nuestra parte).
+/// Windows: intenta `CREATE_BREAKAWAY_FROM_JOB` (ADR 0011). Si falla, consulta
+/// kill-on-close del job padre y solo reintenta sin breakaway si es seguro o
+/// si `HOSTIG_ALLOW_JOB_WITHOUT_BREAKAWAY=1` (tests/CI).
 #[cfg(windows)]
 fn spawn_windows(command: &mut Command, exe: &Path) -> Result<std::process::Child> {
     use std::os::windows::process::CommandExt;
@@ -94,15 +95,16 @@ fn spawn_windows(command: &mut Command, exe: &Path) -> Result<std::process::Chil
     match command.spawn() {
         Ok(child) => Ok(child),
         Err(error) if error.raw_os_error() == Some(5) => {
+            let BreakawayFallback::ProceedWithWarning { detail } = decide_after_breakaway_denied()?;
             eprintln!(
-                "{{\"level\":\"warn\",\"module\":\"processes\",\"message\":\"CREATE_BREAKAWAY_FROM_JOB denegado; reintento sin breakaway\",\"cause\":\"{error}\",\"action\":\"arranca el supervisor fuera de un job restrictivo si puedes (ADR 0011)\"}}"
+                "{{\"level\":\"warn\",\"module\":\"processes\",\"message\":\"arranque sin CREATE_BREAKAWAY_FROM_JOB\",\"cause\":\"{detail}\",\"action\":\"preferible arrancar fuera de un job restrictivo (ADR 0011)\"}}"
             );
             command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
             command.spawn().map_err(|retry| {
                 ProcessError::new(
                     "no se pudo lanzar el proceso",
                     format!("{}: {retry}", exe.display()),
-                    "el job padre denegó el breakaway y el reintento también falló; arranca el supervisor fuera de ese job (ADR 0011)",
+                    "revisa la ruta del runtime y los permisos",
                 )
             })
         }
@@ -110,6 +112,39 @@ fn spawn_windows(command: &mut Command, exe: &Path) -> Result<std::process::Chil
             "no se pudo lanzar el proceso",
             format!("{}: {error}", exe.display()),
             "revisa la ruta del runtime y los permisos",
+        )),
+    }
+}
+
+/// Igual que `spawn_windows` pero para un `Command` ya configurado (p. ej. CLI → supervisor).
+#[cfg(windows)]
+pub fn spawn_detached_windows(command: &mut Command) -> Result<std::process::Child> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP);
+    match command.spawn() {
+        Ok(child) => Ok(child),
+        Err(error) if error.raw_os_error() == Some(5) => {
+            let BreakawayFallback::ProceedWithWarning { detail } = decide_after_breakaway_denied()?;
+            eprintln!(
+                "{{\"level\":\"warn\",\"module\":\"cli\",\"message\":\"supervisor sin CREATE_BREAKAWAY_FROM_JOB\",\"cause\":\"{detail}\",\"action\":\"arranca Hostig desde fuera de ese terminal o herramienta (ADR 0011)\"}}"
+            );
+            command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+            command.spawn().map_err(|retry| {
+                ProcessError::new(
+                    "no se pudo lanzar el supervisor",
+                    retry.to_string(),
+                    "revisa permisos y la ruta de hostig-supervisor",
+                )
+            })
+        }
+        Err(error) => Err(ProcessError::new(
+            "no se pudo lanzar el supervisor",
+            error.to_string(),
+            "revisa permisos y la ruta de hostig-supervisor",
         )),
     }
 }

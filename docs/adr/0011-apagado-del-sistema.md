@@ -50,7 +50,11 @@ No se inicia un volcado. No se inicia una parada larga. Si el plazo no da para u
 
 Ningún Job Object que contenga a MariaDB lleva `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
 
-MariaDB se crea con `CREATE_BREAKAWAY_FROM_JOB` cuando el job padre permite salir. Si el sistema niega el breakaway, el supervisor no arranca MariaDB dentro de ese job: el error dice la causa y la acción (arrancar el supervisor fuera de ese job). La muerte del supervisor tiene que dejar la base viva para que el arranque siguiente pueda adoptarla.
+MariaDB se crea con `CREATE_BREAKAWAY_FROM_JOB` cuando el job padre permite salir. Si el sistema niega el breakaway, el supervisor consulta (`IsProcessInJob` + `QueryInformationJobObject`) si el job tiene `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Si lo tiene, no arranca MariaDB: la causa es «el proceso padre está en un job que mataría MariaDB al cerrarse» y la acción «arranca Hostig desde fuera de ese terminal o herramienta». Si el job no mata al cerrarse, puede seguir sin breakaway y lo registra como aviso. La misma política aplica cuando la CLI lanza `hostig-supervisor`.
+
+Para tests y CI (nunca en uso normal), `HOSTIG_ALLOW_JOB_WITHOUT_BREAKAWAY=1` permite el reintento sin breakaway aunque el job tenga kill-on-close. Sin esa variable, el CI en runners o IDEs que imponen un job restrictivo fallaría al arrancar.
+
+La muerte del supervisor tiene que dejar la base viva para que el arranque siguiente pueda adoptarla.
 
 Apache y PHP pueden ir en un job propio si el test de cierre de Apache Lounge del [ADR 0003](0003-supervision-de-procesos.md) lo necesita para un ctrl-break. Ese job no incluye a MariaDB y tampoco usa kill-on-close.
 
@@ -58,7 +62,7 @@ Apache y PHP pueden ir en un job propio si el test de cierre de Apache Lounge de
 
 - Hace falta un hilo con bucle de mensajes para la ventana oculta de apagado y de cierre de sesión. La suspensión no usa esa ventana: llega por el callback de `RegisterSuspendResumeNotification`.
 - Un apagado del sistema puede cortar peticiones. Es preferible a un kill de MariaDB, y no sustituye al `stop` normal, que sí puede volcar.
-- Si el breakaway está denegado, la base no arranca. El mensaje tiene que decirlo antes de dejar un datadir a medias.
+- Si el breakaway está denegado y el job tiene kill-on-close, la base no arranca. El mensaje tiene que decirlo antes de dejar un datadir a medias.
 - La suspensión que deja MariaDB en marcha puede coincidir con un portátil que duerme a mitad de una escritura. InnoDB ya hace esa recuperación; el supervisor no la adelanta con un kill.
 
 ## Alternativas descartadas

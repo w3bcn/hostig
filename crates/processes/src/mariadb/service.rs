@@ -17,7 +17,7 @@ use crate::mariadb::logparse::{
 };
 use crate::os::{process_creation_time, process_image_path};
 use crate::registry::{try_adopt, AdoptOutcome, ProcessRecord};
-use crate::spawn::{emergency_kill, spawn_server, SpawnSpec};
+use crate::spawn::{spawn_server, SpawnSpec};
 use hostig_ports::{check as check_port, PortState};
 use hostig_runtimes::{runtime_dir, Catalog, MANIFEST_NAME};
 
@@ -273,22 +273,29 @@ impl DbService {
         thread::spawn(move || {
             let outcome = service.run_start(request);
             let mut inner = service.inner.lock().expect("db inner");
-            if let Some(job) = inner.jobs.get_mut(&job_id) {
-                match &outcome {
-                    Ok(pid) => {
+            match &outcome {
+                Ok(pid) => {
+                    if let Some(job) = inner.jobs.get_mut(&job_id) {
                         job.state = "succeeded".into();
                         job.pid = Some(*pid);
-                        inner.status.state = DbState::Running;
-                        inner.status.pid = Some(*pid);
-                        inner.status.error = None;
                     }
-                    Err(error) => {
+                    inner.status.state = DbState::Running;
+                    inner.status.pid = Some(*pid);
+                    inner.status.error = None;
+                }
+                Err(error) => {
+                    let alive_pid = inner
+                        .status
+                        .pid
+                        .filter(|p| hostig_ipc::process_is_running(*p));
+                    if let Some(job) = inner.jobs.get_mut(&job_id) {
                         job.state = "failed".into();
                         job.error = Some(error.into());
-                        inner.status.state = DbState::Failed;
-                        inner.status.pid = None;
-                        inner.status.error = Some(error.to_string());
+                        job.pid = alive_pid;
                     }
+                    inner.status.state = DbState::Failed;
+                    inner.status.error = Some(error.to_string());
+                    inner.status.pid = alive_pid;
                 }
             }
         });
@@ -367,34 +374,76 @@ impl DbService {
             inner.status.pid = Some(pid);
         }
 
-        let ready = wait_until_ready(&paths, request.port, log_offset, READY_TIMEOUT)?;
+        let ready = wait_until_ready(
+            &paths,
+            request.port,
+            &request.version,
+            log_offset,
+            READY_TIMEOUT,
+        )?;
         if !ready {
-            let _ = self.force_cleanup_after_failed_start(&request.id);
-            return Err(ProcessError::new(
-                "MariaDB no quedó lista",
-                "no apareció ready for connections ni respondió el ping a tiempo",
-                "revisa el error log de la instancia",
-            ));
+            return Err(self.after_ready_timeout(&request.id, request.port, &request.version, pid));
         }
         Ok(pid)
     }
 
-    fn force_cleanup_after_failed_start(&self, id: &str) -> Result<()> {
-        if let Some(record) = ProcessRecord::load(&self.data_dir, id)? {
-            let _ = emergency_kill(&self.data_dir, id, record.pid);
+    /// Tras agotar el plazo de ready: Failed con causa/acción. Si el ping responde,
+    /// intenta shutdown ordenado; si no, deja el proceso registrado. Nunca TerminateProcess.
+    fn after_ready_timeout(&self, id: &str, port: u16, version: &str, pid: u32) -> ProcessError {
+        let paths = InstancePaths::new(&self.data_dir, id);
+        let ping_ok = admin_ping(&paths, port, version).unwrap_or(false);
+        if ping_ok {
+            let _ = admin_shutdown(&paths, port, version, &self.data_dir);
+            // Esperamos un poco a un cierre limpio; si no, el proceso queda registrado.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                {
+                    let mut inner = self.inner.lock().expect("db inner");
+                    if let Some(child) = inner.child.as_mut() {
+                        let _ = child.try_wait();
+                    }
+                }
+                if !hostig_ipc::process_is_running(pid) {
+                    let _ = ProcessRecord::remove(&self.data_dir, id);
+                    let mut inner = self.inner.lock().expect("db inner");
+                    if let Some(mut child) = inner.child.take() {
+                        let _ = child.wait();
+                    }
+                    inner.status.pid = None;
+                    return ProcessError::new(
+                        "MariaDB no quedó lista",
+                        "no apareció ready for connections a tiempo; se pidió shutdown tras ping OK",
+                        "revisa el error log; los plazos largos de recovery son el bloque 3b (ADR 0012)",
+                    );
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            ProcessError::new(
+                "MariaDB no quedó lista",
+                "ping respondió pero el apagado ordenado no terminó a tiempo; el proceso sigue registrado",
+                "espera o usa hostig db status; hostig db kill <pid> solo como emergencia",
+            )
+        } else {
+            // Proceso vivo, sin ping: dejarlo registrado (p. ej. recovery InnoDB).
+            ProcessError::new(
+                "MariaDB no quedó lista",
+                "no apareció ready for connections ni respondió el ping a tiempo; el proceso sigue registrado",
+                "revisa el error log; no se mata el proceso (ADR 0003); plazos de recovery en el bloque 3b",
+            )
         }
-        let mut inner = self.inner.lock().expect("db inner");
-        if let Some(mut child) = inner.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        Ok(())
     }
 
     pub fn stop_async(self: &Arc<Self>) -> Result<DbJobStatus> {
         let job_id = Uuid::new_v4().to_string();
         let (id, port, pid, running_status) = {
             let mut inner = self.inner.lock().expect("db inner");
+            if matches!(inner.status.state, DbState::Starting) {
+                return Err(ProcessError::new(
+                    "arranque en curso",
+                    "el estado es Starting",
+                    "espera a que termine el arranque",
+                ));
+            }
             if matches!(inner.status.state, DbState::Stopped) {
                 return Ok(DbJobStatus {
                     job_id,
@@ -527,7 +576,7 @@ impl DbService {
     }
 
     pub fn kill(&self, cited_pid: u32) -> Result<()> {
-        emergency_kill(&self.data_dir, DEFAULT_INSTANCE_ID, cited_pid)?;
+        crate::spawn::emergency_kill(&self.data_dir, DEFAULT_INSTANCE_ID, cited_pid)?;
         let mut inner = self.inner.lock().expect("db inner");
         inner.status.state = DbState::Stopped;
         inner.status.pid = None;
@@ -552,13 +601,14 @@ fn fs_remove_datadir_ini(paths: &InstancePaths) -> Result<()> {
 fn wait_until_ready(
     paths: &InstancePaths,
     port: u16,
+    version: &str,
     log_offset: u64,
     budget: Duration,
 ) -> Result<bool> {
     let deadline = Instant::now() + budget;
     while Instant::now() < deadline {
         let log = read_log_since(&paths.error_log, log_offset)?;
-        if log_contains_ready(&log) && admin_ping(paths, port)? {
+        if log_contains_ready(&log) && admin_ping(paths, port, version)? {
             return Ok(true);
         }
         thread::sleep(Duration::from_millis(400));
@@ -566,29 +616,45 @@ fn wait_until_ready(
     Ok(false)
 }
 
-fn admin_ping(paths: &InstancePaths, port: u16) -> Result<bool> {
-    // Localiza mariadb-admin junto a la instancia vía basedir del my.ini es pesado;
-    // usamos el admin.cnf y buscamos el binario en PATH controlado del runtime
-    // guardado... Simplificación: buscamos relativo al password file / data_dir runtimes.
-    let data_dir = paths
+fn mariadb_bin_for_version(data_dir: &std::path::Path, version: &str) -> Result<PathBuf> {
+    let catalog = Catalog::embedded().map_err(|error| {
+        ProcessError::new(
+            "catálogo ilegible",
+            error.to_string(),
+            "recompila con catalog/runtimes.toml",
+        )
+    })?;
+    let entry = catalog.find("mariadb", version).ok_or_else(|| {
+        ProcessError::new(
+            "MariaDB no está en el catálogo",
+            format!("falta mariadb@{version}"),
+            "actualiza el catálogo o instala esa versión",
+        )
+    })?;
+    find_mariadb_bin(&runtime_dir(data_dir, entry))
+}
+
+fn instance_data_dir(paths: &InstancePaths) -> Result<PathBuf> {
+    paths
         .root
         .parent()
         .and_then(|p| p.parent())
+        .map(PathBuf::from)
         .ok_or_else(|| {
             ProcessError::new(
                 "ruta de instancia inválida",
                 paths.root.display().to_string(),
                 "revisa HOSTIG_DATA_DIR",
             )
-        })?;
-    let catalog = Catalog::embedded().ok();
-    let Some(catalog) = catalog else {
-        return Ok(false);
+        })
+}
+
+fn admin_ping(paths: &InstancePaths, port: u16, version: &str) -> Result<bool> {
+    let data_dir = instance_data_dir(paths)?;
+    let bin = match mariadb_bin_for_version(&data_dir, version) {
+        Ok(b) => b,
+        Err(_) => return Ok(false),
     };
-    let Some(entry) = catalog.find("mariadb", DEFAULT_MARIADB_VERSION) else {
-        return Ok(false);
-    };
-    let bin = find_mariadb_bin(&runtime_dir(data_dir, entry))?;
     let admin = match exe_in(&bin, "mariadb-admin") {
         Some(p) => p,
         None => return Ok(false),
@@ -611,4 +677,37 @@ fn admin_ping(paths: &InstancePaths, port: u16) -> Result<bool> {
         Ok(out) => Ok(out.status.success()),
         Err(_) => Ok(false),
     }
+}
+
+fn admin_shutdown(
+    paths: &InstancePaths,
+    port: u16,
+    version: &str,
+    data_dir: &std::path::Path,
+) -> Result<()> {
+    if !paths.admin_cnf.is_file() {
+        return Ok(());
+    }
+    let bin = mariadb_bin_for_version(data_dir, version)?;
+    let admin = exe_in(&bin, "mariadb-admin").ok_or_else(|| {
+        ProcessError::new(
+            "mariadb-admin ausente",
+            bin.display().to_string(),
+            "reinstala MariaDB",
+        )
+    })?;
+    let defaults_extra = format!("--defaults-extra-file={}", paths.admin_cnf.display());
+    let _ = Command::new(&admin)
+        .arg(&defaults_extra)
+        .arg("--protocol=tcp")
+        .arg("-h")
+        .arg("127.0.0.1")
+        .arg("-P")
+        .arg(port.to_string())
+        .arg("shutdown")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    Ok(())
 }
