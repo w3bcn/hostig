@@ -470,6 +470,11 @@ dependencies = [
 [[package]]
 name = "hostig-ports"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "windows",
+]
 
 [[package]]
 name = "hostig-processes"
@@ -499,6 +504,7 @@ name = "hostig-supervisor"
 version = "0.1.0"
 dependencies = [
  "hostig-ipc",
+ "hostig-ports",
  "hostig-runtimes",
  "nix",
  "serde_json",
