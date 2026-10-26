@@ -320,7 +320,10 @@ fn handle_ports_check(
     }
 
     let mut rows = Vec::new();
-    for (port, result) in ports.iter().copied().zip(hostig_ports::check_many(&ports, expected_pid))
+    for (port, result) in ports
+        .iter()
+        .copied()
+        .zip(hostig_ports::check_many(&ports, expected_pid))
     {
         match result {
             Ok(row) => {

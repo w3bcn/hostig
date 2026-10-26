@@ -16,10 +16,7 @@ pub fn is_privileged(port: u16) -> bool {
 
 /// Rango convencional que contiene `port`, si encaja en alguno del ADR.
 pub fn for_port(port: u16) -> Option<RangeInclusive<u16>> {
-    for range in [HTTP, HTTPS, MARIADB, PHP_WINDOWS] {
-        if range.contains(&port) {
-            return Some(range);
-        }
-    }
-    None
+    [HTTP, HTTPS, MARIADB, PHP_WINDOWS]
+        .into_iter()
+        .find(|range| range.contains(&port))
 }

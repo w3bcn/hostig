@@ -32,7 +32,11 @@ impl PortError {
     pub fn range_full(range: std::ops::RangeInclusive<u16>) -> Self {
         Self::new(
             "rango de puertos lleno",
-            format!("no queda ningún puerto libre en {}-{}", range.start(), range.end()),
+            format!(
+                "no queda ningún puerto libre en {}-{}",
+                range.start(),
+                range.end()
+            ),
             "elige un puerto a mano en el manifiesto",
         )
     }

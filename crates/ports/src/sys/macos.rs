@@ -282,7 +282,13 @@ fn listeners_for_pid(pid: u32) -> std::result::Result<Vec<FoundListener>, ()> {
         return Err(());
     }
     let count = (size_hint as usize) / mem::size_of::<ProcFdInfo>();
-    let mut fds = vec![ProcFdInfo { proc_fd: 0, proc_fdtype: 0 }; count];
+    let mut fds = vec![
+        ProcFdInfo {
+            proc_fd: 0,
+            proc_fdtype: 0
+        };
+        count
+    ];
     let got = unsafe {
         proc_pidinfo(
             pid as c_int,

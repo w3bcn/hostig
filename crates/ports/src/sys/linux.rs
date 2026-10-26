@@ -91,7 +91,10 @@ fn parse_local_v4(field: &str) -> Option<(IpAddr, u16)> {
     let addr_n = u32::from_str_radix(addr_s, 16).ok()?;
     let port = u16::from_str_radix(port_s, 16).ok()?;
     let bytes = addr_n.to_le_bytes();
-    Some((IpAddr::V4(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3])), port))
+    Some((
+        IpAddr::V4(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3])),
+        port,
+    ))
 }
 
 fn parse_local_v6(field: &str) -> Option<(IpAddr, u16)> {

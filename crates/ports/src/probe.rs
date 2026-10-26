@@ -25,7 +25,7 @@ pub fn classify_bind_denied(error: &io::Error) -> Option<PortState> {
 /// Intenta `bind` en `127.0.0.1:port` y suelta el socket de inmediato.
 ///
 /// - Ok(()) — el puerto acepta bind (libre para nosotros).
-/// - Err(Reservado) — el sistema lo tiene excluido (Hyper-V, WSL, Docker…).
+/// - Err(Reservado) — el sistema lo tiene excluido o denegado.
 /// - Err(OcupadoDueñoNoVisible) — bind dice ocupado aunque la tabla no lo vio.
 pub fn probe_loopback(port: u16) -> std::result::Result<(), PortState> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -49,12 +49,31 @@ pub fn probe_loopback(port: u16) -> std::result::Result<(), PortState> {
     }
 }
 
+/// Causa de «reservado» en Windows (Hyper-V / WSL / Docker).
+pub fn reserved_cause_windows(port: u16) -> String {
+    format!("puerto {port}: puerto reservado por el sistema (Hyper-V, WSL o Docker)")
+}
+
+/// Causa de «reservado» en Linux/macOS (bind denegado / privilegios).
+pub fn reserved_cause_unix(port: u16) -> String {
+    format!(
+        "puerto {port}: el sistema no permite abrir este puerto sin privilegios (puertos por debajo de 1024)"
+    )
+}
+
+/// Causa según la plataforma actual.
+pub fn reserved_cause(port: u16) -> String {
+    if cfg!(windows) {
+        reserved_cause_windows(port)
+    } else {
+        reserved_cause_unix(port)
+    }
+}
+
 pub fn reserved_error(port: u16) -> PortError {
     PortError::new(
         "puerto reservado",
-        format!(
-            "puerto {port}: puerto reservado por el sistema (Hyper-V, WSL o Docker)"
-        ),
+        reserved_cause(port),
         "usa el puerto sugerido",
     )
 }
