@@ -32,6 +32,11 @@ enum Commands {
         #[command(subcommand)]
         action: PortsCommand,
     },
+    /// Instancia MariaDB local (ADR 0003).
+    Db {
+        #[command(subcommand)]
+        action: DbCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -66,6 +71,28 @@ enum PortsCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum DbCommand {
+    /// Inicializa si hace falta, arranca MariaDB y espera a que quede lista.
+    Start {
+        /// Puerto TCP (defecto 3306). No se cambia solo si está ocupado.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Versión del catálogo (defecto 11.4.13).
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// Apagado ordenado con mariadb-admin shutdown.
+    Stop,
+    /// Estado de la instancia (pid, puerto, estado).
+    Status,
+    /// Emergencia: mata solo el PID registrado si coincide la hora de creación.
+    Kill {
+        /// PID que debe coincidir con el registro del supervisor.
+        pid: u32,
+    },
+}
+
 fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
@@ -82,6 +109,12 @@ fn main() {
         },
         Commands::Ports { action } => match action {
             PortsCommand::Check { ports } => ports_check(&ports),
+        },
+        Commands::Db { action } => match action {
+            DbCommand::Start { port, version } => db_start(port, version.as_deref()),
+            DbCommand::Stop => db_stop(),
+            DbCommand::Status => db_status(),
+            DbCommand::Kill { pid } => db_kill(pid),
         },
     };
     std::process::exit(code);
@@ -395,6 +428,117 @@ fn runtimes_job(job_id: &str) -> i32 {
         }
         Err(error) => fail_client(error),
     }
+}
+
+fn db_start(port: Option<u16>, version: Option<&str>) -> i32 {
+    let layout = match Layout::from_env() {
+        Ok(layout) => layout,
+        Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),
+    };
+    let mut params = json!({});
+    if let Some(port) = port {
+        params["port"] = json!(port);
+    }
+    if let Some(version) = version {
+        params["version"] = json!(version);
+    }
+    let started = match Client::call(&layout, "db.start", params) {
+        Ok(result) => result,
+        Err(error) => return fail_client(error),
+    };
+    poll_db_job(&layout, &started, Duration::from_secs(60 * 5))
+}
+
+fn db_stop() -> i32 {
+    let layout = match Layout::from_env() {
+        Ok(layout) => layout,
+        Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),
+    };
+    let started = match Client::call(&layout, "db.stop", json!({})) {
+        Ok(result) => result,
+        Err(error) => return fail_client(error),
+    };
+    poll_db_job(&layout, &started, Duration::from_secs(60))
+}
+
+fn db_status() -> i32 {
+    let layout = match Layout::from_env() {
+        Ok(layout) => layout,
+        Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),
+    };
+    match Client::call(&layout, "db.status", json!({})) {
+        Ok(result) => {
+            println!("{result}");
+            0
+        }
+        Err(error) => fail_client(error),
+    }
+}
+
+fn db_kill(pid: u32) -> i32 {
+    let layout = match Layout::from_env() {
+        Ok(layout) => layout,
+        Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),
+    };
+    match Client::call(&layout, "db.kill", json!({ "pid": pid })) {
+        Ok(result) => {
+            println!("{result}");
+            0
+        }
+        Err(error) => fail_client(error),
+    }
+}
+
+fn poll_db_job(layout: &Layout, started: &Value, budget: Duration) -> i32 {
+    let job_id = started.get("job_id").and_then(Value::as_str).unwrap_or("");
+    if job_id.is_empty() {
+        println!("{started}");
+        return 0;
+    }
+    let state = started.get("state").and_then(Value::as_str).unwrap_or("");
+    if state == "succeeded" || state == "failed" {
+        if state == "failed" {
+            return fail_db_job(started);
+        }
+        println!("{started}");
+        return 0;
+    }
+    let deadline = Instant::now() + budget;
+    loop {
+        let status = match Client::call(layout, "db.job", json!({ "job_id": job_id })) {
+            Ok(value) => value,
+            Err(error) => return fail_client(error),
+        };
+        let state = status.get("state").and_then(Value::as_str).unwrap_or("");
+        match state {
+            "succeeded" => {
+                println!("{status}");
+                return 0;
+            }
+            "failed" => return fail_db_job(&status),
+            _ => {
+                if Instant::now() > deadline {
+                    return fail(
+                        "la operación de base de datos no terminó a tiempo",
+                        &format!("consulta el estado con hostig db status (job {job_id})"),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+}
+
+fn fail_db_job(status: &Value) -> i32 {
+    let cause = status
+        .pointer("/error/cause")
+        .and_then(Value::as_str)
+        .unwrap_or("la operación falló");
+    let action = status
+        .pointer("/error/action")
+        .and_then(Value::as_str)
+        .unwrap_or("revisa el log del supervisor y el error log de la instancia");
+    fail(cause, action)
 }
 
 fn parse_spec(spec: &str) -> Result<(&str, &str), i32> {

@@ -8,6 +8,7 @@ use hostig_ipc::{
     tokens_match, write_frame, ByteStream, FrameError, Layout, Listener, MAX_FRAME_LEN,
     PROTOCOL_VERSION,
 };
+use hostig_processes::mariadb::{DbService, StartRequest, DEFAULT_MARIADB_VERSION};
 use hostig_runtimes::{clean_tmp_runtimes, RuntimeService};
 use serde_json::{json, Value};
 
@@ -18,6 +19,11 @@ use crate::log::Logger;
 const SESSION_IDLE: Duration = Duration::from_secs(5);
 /// Tope de sesiones concurrentes para no agotar hilos.
 const MAX_SESSIONS: usize = 32;
+
+struct Services {
+    runtimes: Arc<RuntimeService>,
+    db: Arc<DbService>,
+}
 
 pub fn serve(layout: &Layout, log: &Logger, _lock: Lock) -> std::io::Result<()> {
     let token = load_or_create_token(&layout.token_path)?;
@@ -47,6 +53,16 @@ pub fn serve(layout: &Layout, log: &Logger, _lock: Lock) -> std::io::Result<()> 
             ));
         }
     };
+    let db = match DbService::with_embedded(&layout.data_dir) {
+        Ok(service) => Arc::new(service),
+        Err(error) => {
+            log.error("processes", &error.message, &error.cause, &error.action);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error.to_string(),
+            ));
+        }
+    };
     let listener = listen(layout)?;
     log.info(
         "supervisor",
@@ -54,8 +70,9 @@ pub fn serve(layout: &Layout, log: &Logger, _lock: Lock) -> std::io::Result<()> 
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let active = Arc::new(AtomicUsize::new(0));
+    let services = Services { runtimes, db };
     let result = accept_loop(
-        &listener, layout, &token, log, &shutdown, &active, &runtimes,
+        &listener, layout, &token, log, &shutdown, &active, &services,
     );
     wait_for_sessions(&active, Duration::from_secs(6));
     let _ = std::fs::remove_file(&layout.pid_path);
@@ -73,7 +90,7 @@ fn accept_loop(
     log: &Logger,
     shutdown: &Arc<AtomicBool>,
     active: &Arc<AtomicUsize>,
-    runtimes: &Arc<RuntimeService>,
+    services: &Services,
 ) -> std::io::Result<()> {
     let token = Arc::new(token.to_string());
     let log = log.clone();
@@ -108,11 +125,12 @@ fn accept_loop(
         let log = log.clone();
         let shutdown = Arc::clone(shutdown);
         let active = Arc::clone(active);
-        let runtimes = Arc::clone(runtimes);
+        let runtimes = Arc::clone(&services.runtimes);
+        let db = Arc::clone(&services.db);
         let wake_layout = layout.clone();
         active.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
-            let outcome = session(stream, &token, &log, &shutdown, &runtimes);
+            let outcome = session(stream, &token, &log, &shutdown, &runtimes, &db);
             if shutdown.load(Ordering::SeqCst) {
                 wake_accept(&wake_layout);
             }
@@ -149,6 +167,7 @@ fn session(
     log: &Logger,
     shutdown: &AtomicBool,
     runtimes: &RuntimeService,
+    db: &Arc<DbService>,
 ) -> std::io::Result<()> {
     let first = match read_frame_timed(&mut stream, log, "el cliente no envió su mensaje a tiempo")
     {
@@ -260,6 +279,45 @@ fn session(
                 reply_error(&mut stream, id, -32020, &message, &cause, &action)?;
             }
         },
+        "db.start" => match handle_db_start(db, &request, log) {
+            Ok(status) => {
+                write_frame(&mut stream, &protocol_success(id, json!(status)))?;
+            }
+            Err((message, cause, action)) => {
+                reply_error(&mut stream, id, -32030, &message, &cause, &action)?;
+            }
+        },
+        "db.stop" => match handle_db_stop(db, log) {
+            Ok(status) => {
+                write_frame(&mut stream, &protocol_success(id, json!(status)))?;
+            }
+            Err((message, cause, action)) => {
+                reply_error(&mut stream, id, -32031, &message, &cause, &action)?;
+            }
+        },
+        "db.status" => {
+            let status = db.status();
+            write_frame(&mut stream, &protocol_success(id, json!(status)))?;
+        }
+        "db.job" => match handle_db_job(db, &request) {
+            Ok(status) => {
+                write_frame(&mut stream, &protocol_success(id, json!(status)))?;
+            }
+            Err((message, cause, action)) => {
+                reply_error(&mut stream, id, -32032, &message, &cause, &action)?;
+            }
+        },
+        "db.kill" => match handle_db_kill(db, &request, log) {
+            Ok(()) => {
+                write_frame(
+                    &mut stream,
+                    &protocol_success(id, json!({ "killed": true })),
+                )?;
+            }
+            Err((message, cause, action)) => {
+                reply_error(&mut stream, id, -32033, &message, &cause, &action)?;
+            }
+        },
         other => {
             reply_error(
                 &mut stream,
@@ -267,7 +325,7 @@ fn session(
                 -32601,
                 "método desconocido",
                 &format!("el método {other} no existe"),
-                "usa status, shutdown, runtimes.* o ports.check",
+                "usa status, shutdown, runtimes.*, ports.check o db.*",
             )?;
         }
     }
@@ -392,6 +450,104 @@ fn handle_runtimes_job(
     runtimes
         .job(job_id)
         .map_err(|error| (error.message, error.cause, error.action))
+}
+
+fn handle_db_start(
+    db: &Arc<DbService>,
+    request: &Value,
+    log: &Logger,
+) -> Result<hostig_processes::mariadb::DbJobStatus, (String, String, String)> {
+    let mut start = StartRequest::default();
+    if let Some(id) = request.pointer("/params/id").and_then(Value::as_str) {
+        if !id.is_empty() {
+            start.id = id.to_string();
+        }
+    }
+    if let Some(version) = request.pointer("/params/version").and_then(Value::as_str) {
+        if !version.is_empty() {
+            start.version = version.to_string();
+        }
+    } else {
+        start.version = DEFAULT_MARIADB_VERSION.to_string();
+    }
+    if let Some(port) = request.pointer("/params/port").and_then(Value::as_u64) {
+        if port > 0 && port <= u64::from(u16::MAX) {
+            start.port = port as u16;
+        }
+    }
+    match db.start_async(start) {
+        Ok(status) => Ok(status),
+        Err(error) => {
+            log.error("processes", &error.message, &error.cause, &error.action);
+            Err((error.message, error.cause, error.action))
+        }
+    }
+}
+
+fn handle_db_stop(
+    db: &Arc<DbService>,
+    log: &Logger,
+) -> Result<hostig_processes::mariadb::DbJobStatus, (String, String, String)> {
+    match db.stop_async() {
+        Ok(status) => Ok(status),
+        Err(error) => {
+            log.error("processes", &error.message, &error.cause, &error.action);
+            Err((error.message, error.cause, error.action))
+        }
+    }
+}
+
+fn handle_db_job(
+    db: &DbService,
+    request: &Value,
+) -> Result<hostig_processes::mariadb::DbJobStatus, (String, String, String)> {
+    let job_id = request
+        .pointer("/params/job_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if job_id.is_empty() {
+        return Err((
+            "parámetros incompletos".into(),
+            "falta job_id".into(),
+            "usa el id que devolvió db.start o db.stop".into(),
+        ));
+    }
+    db.job(job_id)
+        .map_err(|error| (error.message, error.cause, error.action))
+}
+
+fn handle_db_kill(
+    db: &DbService,
+    request: &Value,
+    log: &Logger,
+) -> Result<(), (String, String, String)> {
+    let pid = request
+        .pointer("/params/pid")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            (
+                "parámetros incompletos".into(),
+                "falta pid".into(),
+                "usa hostig db kill <pid>".into(),
+            )
+        })?;
+    if pid == 0 || pid > u64::from(u32::MAX) {
+        return Err((
+            "PID inválido".into(),
+            format!("pid={pid}"),
+            "cita el PID de hostig db status".into(),
+        ));
+    }
+    match db.kill(pid as u32) {
+        Ok(()) => {
+            log.info("processes", &format!("kill de emergencia del pid {pid}"));
+            Ok(())
+        }
+        Err(error) => {
+            log.error("processes", &error.message, &error.cause, &error.action);
+            Err((error.message, error.cause, error.action))
+        }
+    }
 }
 
 fn handle_runtimes_verify(

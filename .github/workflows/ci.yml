@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust:
     name: rust (${{ matrix.os }})
@@ -21,11 +25,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: hostig-rust
+      - name: Cache MariaDB runtime (Windows IT)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/hostig-mariadb-it-cache
+          key: mariadb-it-${{ hashFiles('catalog/runtimes.toml') }}-11.4.13-winx64
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
+        env:
+          HOSTIG_MARIADB_IT_CACHE: ${{ runner.temp }}/hostig-mariadb-it-cache
         run: cargo test --workspace
 
   frontend:
