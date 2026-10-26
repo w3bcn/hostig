@@ -249,6 +249,17 @@ fn session(
                 reply_error(&mut stream, id, -32012, &message, &cause, &action)?;
             }
         },
+        "ports.check" => match handle_ports_check(&request, log) {
+            Ok(rows) => {
+                write_frame(
+                    &mut stream,
+                    &protocol_success(id, json!({ "results": rows })),
+                )?;
+            }
+            Err((message, cause, action)) => {
+                reply_error(&mut stream, id, -32020, &message, &cause, &action)?;
+            }
+        },
         other => {
             reply_error(
                 &mut stream,
@@ -256,11 +267,82 @@ fn session(
                 -32601,
                 "método desconocido",
                 &format!("el método {other} no existe"),
-                "usa status, shutdown o runtimes.*",
+                "usa status, shutdown, runtimes.* o ports.check",
             )?;
         }
     }
     wait_for_close_timed(&mut stream, log)
+}
+
+fn handle_ports_check(
+    request: &Value,
+    log: &Logger,
+) -> Result<Vec<serde_json::Value>, (String, String, String)> {
+    let expected_pid = request
+        .pointer("/params/expected_pid")
+        .and_then(Value::as_u64)
+        .map(|v| v as u32);
+    let mut ports: Vec<u16> = Vec::new();
+    if let Some(list) = request.pointer("/params/ports").and_then(Value::as_array) {
+        for item in list {
+            let Some(port) = item.as_u64() else {
+                return Err((
+                    "parámetros inválidos".into(),
+                    "ports debe ser una lista de números".into(),
+                    "pasa ports: [8080, 3306]".into(),
+                ));
+            };
+            if port > u16::MAX as u64 {
+                return Err((
+                    "puerto fuera de rango".into(),
+                    format!("{port} no cabe en u16"),
+                    "usa un puerto entre 1 y 65535".into(),
+                ));
+            }
+            ports.push(port as u16);
+        }
+    } else if let Some(port) = request.pointer("/params/port").and_then(Value::as_u64) {
+        if port > u16::MAX as u64 {
+            return Err((
+                "puerto fuera de rango".into(),
+                format!("{port} no cabe en u16"),
+                "usa un puerto entre 1 y 65535".into(),
+            ));
+        }
+        ports.push(port as u16);
+    }
+    if ports.is_empty() {
+        return Err((
+            "parámetros incompletos".into(),
+            "falta port o ports".into(),
+            "pasa port: 8080 o ports: [8080, 3306]".into(),
+        ));
+    }
+
+    let mut rows = Vec::new();
+    for (port, result) in ports
+        .iter()
+        .copied()
+        .zip(hostig_ports::check_many(&ports, expected_pid))
+    {
+        match result {
+            Ok(row) => {
+                rows.push(serde_json::to_value(row).unwrap_or(json!({})));
+            }
+            Err(error) => {
+                log.error("ports", &error.message, &error.cause, &error.action);
+                rows.push(json!({
+                    "port": port,
+                    "status": "error",
+                    "conflict": true,
+                    "cause": error.cause,
+                    "action": error.action,
+                    "message": error.message,
+                }));
+            }
+        }
+    }
+    Ok(rows)
 }
 
 fn handle_runtimes_install(

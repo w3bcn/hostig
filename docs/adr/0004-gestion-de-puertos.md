@@ -11,13 +11,13 @@ Hostig necesita saber, antes de crear un proceso, si el puerto está libre y, si
 
 ## Decisión
 
-`ports` es un módulo con una interfaz pequeña: `check(puerto) -> libre | ocupado { pid, ruta del ejecutable, nombre }` y `suggest(preferido, rango) -> puerto libre`.
+`ports` es un módulo con una interfaz pequeña: `check(puerto, pid_esperado?) -> libre | ocupado { pid, ruta del ejecutable, nombre } | ocupado_dueño_no_visible | reservado` y `suggest(preferido, rango) -> puerto libre`. Si el ocupante es el `pid_esperado`, no hay conflicto.
 
 ### Detección
 
 Se consulta la tabla TCP del sistema, no se lanza `netstat` como proceso.
 
-- Windows: `GetExtendedTcpTable` con dueño de PID (`TCP_TABLE_OWNER_PID_ALL`), IPv4 e IPv6. El supervisor es un binario de 64 bits, para no repetir el panel de 32 bits de XAMPP preguntando por servidores de 64 bits.
+- Windows: `GetExtendedTcpTable` con dueño de PID (`TCP_TABLE_OWNER_PID_LISTENER`), IPv4 e IPv6. El supervisor es un binario de 64 bits, para no repetir el panel de 32 bits de XAMPP preguntando por servidores de 64 bits. La ruta del ejecutable sale de `QueryFullProcessImageNameW`.
 - Linux: se lee `/proc/net/tcp` y `/proc/net/tcp6`, y el PID se resuelve por los inodos en `/proc/*/fd`.
 - macOS: `proc_pidfdinfo` / las APIs de libproc sobre la tabla de sockets. Si en la implementación una llamada exige privilegios para ver procesos de otros usuarios, el resultado es «ocupado, dueño no visible» y se trata como conflicto. No se asume que está libre.
 
@@ -34,6 +34,14 @@ No se ofrece «cerrar el proceso que molesta» en el MVP. Un botón así, sobre 
 ### Puertos bajos
 
 80, 443 y 53 no se usan en el modo sin privilegios ([ADR 0006](0006-privilegios.md)). El módulo los rechaza con la acción «usar el modo con helper, o un puerto alto».
+
+### Puertos reservados por el sistema
+
+En Windows, Hyper-V, WSL y Docker reservan rangos de puertos (los que muestra `netsh int ipv4 show excludedportrange`). En esos rangos no hay ningún proceso escuchando, pero `bind` falla con `WSAEACCES` (10013).
+
+Cuando la tabla TCP diga que el puerto está libre, Hostig hace una prueba de `bind` en `127.0.0.1` y suelta el socket de inmediato. Si falla con acceso denegado, el resultado es **Reservado**, con la causa «puerto reservado por el sistema (Hyper-V, WSL o Docker)» y la acción de usar el puerto sugerido. `suggest` también salta los puertos reservados.
+
+En Linux y macOS el mismo criterio aplica si `bind` devuelve `EACCES`/`EPERM` sin un listener visible.
 
 ## Consecuencias
 
