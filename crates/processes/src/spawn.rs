@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::error::{ProcessError, Result};
+#[cfg(windows)]
 use crate::job::{decide_after_breakaway_denied, BreakawayFallback};
 use crate::registry::{now_unix_ms, ProcessRecord};
 
