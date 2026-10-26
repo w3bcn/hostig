@@ -27,6 +27,11 @@ enum Commands {
         #[command(subcommand)]
         action: RuntimesCommand,
     },
+    /// Consulta de puertos (ADR 0004).
+    Ports {
+        #[command(subcommand)]
+        action: PortsCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -52,6 +57,15 @@ enum RuntimesCommand {
     Job { job_id: String },
 }
 
+#[derive(Subcommand)]
+enum PortsCommand {
+    /// Comprueba uno o más puertos: libre, ocupado (pid/nombre/ruta) o reservado.
+    Check {
+        /// Puertos a inspeccionar.
+        ports: Vec<u16>,
+    },
+}
+
 fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
@@ -65,6 +79,9 @@ fn main() {
             RuntimesCommand::Install { spec } => runtimes_install(&spec),
             RuntimesCommand::Verify { spec } => runtimes_verify(spec.as_deref()),
             RuntimesCommand::Job { job_id } => runtimes_job(&job_id),
+        },
+        Commands::Ports { action } => match action {
+            PortsCommand::Check { ports } => ports_check(&ports),
         },
     };
     std::process::exit(code);
@@ -296,6 +313,74 @@ fn runtimes_verify(spec: Option<&str>) -> i32 {
         }
         Err(error) => fail_client(error),
     }
+}
+
+fn ports_check(ports: &[u16]) -> i32 {
+    if ports.is_empty() {
+        return fail(
+            "no se indicó ningún puerto",
+            "usa hostig ports check <puerto> [<puerto>...]",
+        );
+    }
+    let layout = match Layout::from_env() {
+        Ok(layout) => layout,
+        Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),
+    };
+    match Client::call(&layout, "ports.check", json!({ "ports": ports })) {
+        Ok(result) => {
+            if let Some(rows) = result.get("results").and_then(Value::as_array) {
+                for row in rows {
+                    print_port_row(row);
+                }
+            } else {
+                println!("{result}");
+            }
+            let conflict = result
+                .get("results")
+                .and_then(Value::as_array)
+                .map(|rows| {
+                    rows.iter().any(|row| {
+                        row.get("conflict") == Some(&json!(true))
+                            || row.get("status") == Some(&json!("error"))
+                    })
+                })
+                .unwrap_or(false);
+            if conflict {
+                1
+            } else {
+                0
+            }
+        }
+        Err(error) => fail_client(error),
+    }
+}
+
+fn print_port_row(row: &Value) {
+    let port = row.get("port").and_then(Value::as_u64).unwrap_or(0);
+    let status = row
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("desconocido");
+    let mut line = format!("{port} {status}");
+    if let Some(pid) = row.get("pid").and_then(Value::as_u64) {
+        line.push_str(&format!(" pid={pid}"));
+    }
+    if let Some(name) = row.get("name").and_then(Value::as_str) {
+        line.push_str(&format!(" name={name}"));
+    }
+    if let Some(path) = row.get("path").and_then(Value::as_str) {
+        line.push_str(&format!(" path={path}"));
+    }
+    if let Some(suggested) = row.get("suggested").and_then(Value::as_u64) {
+        line.push_str(&format!(" sugerido={suggested}"));
+    }
+    if let Some(cause) = row.get("cause").and_then(Value::as_str) {
+        line.push_str(&format!(" ({cause})"));
+    }
+    if let Some(action) = row.get("action").and_then(Value::as_str) {
+        line.push_str(&format!(" → {action}"));
+    }
+    println!("{line}");
 }
 
 fn runtimes_job(job_id: &str) -> i32 {
