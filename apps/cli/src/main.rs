@@ -659,7 +659,7 @@ fn spawn_detached(bin: &std::path::Path) -> std::io::Result<std::process::Child>
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
-        return command.spawn();
+        command.spawn()
     }
     #[cfg(windows)]
     {
