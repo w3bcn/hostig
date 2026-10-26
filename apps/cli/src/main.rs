@@ -22,6 +22,11 @@ enum Commands {
         #[command(subcommand)]
         action: SupervisorCommand,
     },
+    /// Catálogo e instalación de runtimes (ADR 0002).
+    Runtimes {
+        #[command(subcommand)]
+        action: RuntimesCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -32,6 +37,21 @@ enum SupervisorCommand {
     Stop,
 }
 
+#[derive(Subcommand)]
+enum RuntimesCommand {
+    /// Lista las entradas del catálogo y si están instaladas.
+    List,
+    /// Instala un runtime. Formato: componente@version (p. ej. php@8.4.27).
+    Install { spec: String },
+    /// Recalcula hashes de lo instalado frente al manifiesto.
+    Verify {
+        /// Opcional: componente@version para acotar.
+        spec: Option<String>,
+    },
+    /// Consulta el estado de una instalación asíncrona.
+    Job { job_id: String },
+}
+
 fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
@@ -39,6 +59,12 @@ fn main() {
         Commands::Supervisor { action } => match action {
             SupervisorCommand::Start => start(),
             SupervisorCommand::Stop => stop(),
+        },
+        Commands::Runtimes { action } => match action {
+            RuntimesCommand::List => runtimes_list(),
+            RuntimesCommand::Install { spec } => runtimes_install(&spec),
+            RuntimesCommand::Verify { spec } => runtimes_verify(spec.as_deref()),
+            RuntimesCommand::Job { job_id } => runtimes_job(&job_id),
         },
     };
     std::process::exit(code);
@@ -165,6 +191,141 @@ fn stop() -> i32 {
         "el proceso terminó pero el socket o el pipe sigue aceptando conexiones",
         "espera un segundo y vuelve a ejecutar hostig supervisor stop",
     )
+}
+
+fn runtimes_list() -> i32 {
+    let layout = match Layout::from_env() {
+        Ok(layout) => layout,
+        Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),
+    };
+    match Client::call(&layout, "runtimes.list", json!({})) {
+        Ok(result) => {
+            println!("{result}");
+            0
+        }
+        Err(error) => fail_client(error),
+    }
+}
+
+fn runtimes_install(spec: &str) -> i32 {
+    let (component, version) = match parse_spec(spec) {
+        Ok(pair) => pair,
+        Err(code) => return code,
+    };
+    let layout = match Layout::from_env() {
+        Ok(layout) => layout,
+        Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),
+    };
+    let started = match Client::call(
+        &layout,
+        "runtimes.install",
+        json!({ "component": component, "version": version }),
+    ) {
+        Ok(result) => result,
+        Err(error) => return fail_client(error),
+    };
+    let job_id = started.get("job_id").and_then(Value::as_str).unwrap_or("");
+    if job_id.is_empty() {
+        println!("{started}");
+        return 0;
+    }
+    // La instalación puede durar minutos; el IPC corta a los 5 s, así que
+    // sondeamos runtimes.job hasta el estado final.
+    let deadline = Instant::now() + Duration::from_secs(60 * 30);
+    loop {
+        let status = match Client::call(&layout, "runtimes.job", json!({ "job_id": job_id })) {
+            Ok(value) => value,
+            Err(error) => return fail_client(error),
+        };
+        let state = status.get("state").and_then(Value::as_str).unwrap_or("");
+        match state {
+            "succeeded" => {
+                println!("{status}");
+                return 0;
+            }
+            "failed" => {
+                let cause = status
+                    .pointer("/error/cause")
+                    .and_then(Value::as_str)
+                    .unwrap_or("la instalación falló");
+                let action = status
+                    .pointer("/error/action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("revisa el log del supervisor");
+                return fail(cause, action);
+            }
+            _ => {
+                if Instant::now() > deadline {
+                    return fail(
+                        "la instalación no terminó a tiempo",
+                        &format!("consulta hostig runtimes job {job_id}"),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+}
+
+fn runtimes_verify(spec: Option<&str>) -> i32 {
+    let layout = match Layout::from_env() {
+        Ok(layout) => layout,
+        Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),
+    };
+    let mut params = json!({});
+    if let Some(spec) = spec {
+        let (component, version) = match parse_spec(spec) {
+            Ok(pair) => pair,
+            Err(code) => return code,
+        };
+        params = json!({ "component": component, "version": version });
+    }
+    match Client::call(&layout, "runtimes.verify", params) {
+        Ok(result) => {
+            println!("{result}");
+            let failed = result
+                .get("results")
+                .and_then(Value::as_array)
+                .map(|rows| rows.iter().any(|row| row.get("ok") == Some(&json!(false))))
+                .unwrap_or(false);
+            if failed {
+                1
+            } else {
+                0
+            }
+        }
+        Err(error) => fail_client(error),
+    }
+}
+
+fn runtimes_job(job_id: &str) -> i32 {
+    let layout = match Layout::from_env() {
+        Ok(layout) => layout,
+        Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),
+    };
+    match Client::call(&layout, "runtimes.job", json!({ "job_id": job_id })) {
+        Ok(result) => {
+            println!("{result}");
+            0
+        }
+        Err(error) => fail_client(error),
+    }
+}
+
+fn parse_spec(spec: &str) -> Result<(&str, &str), i32> {
+    let Some((component, version)) = spec.split_once('@') else {
+        return Err(fail(
+            &format!("especificación inválida: {spec}"),
+            "usa componente@version, por ejemplo php@8.4.27",
+        ));
+    };
+    if component.is_empty() || version.is_empty() {
+        return Err(fail(
+            &format!("especificación inválida: {spec}"),
+            "usa componente@version, por ejemplo php@8.4.27",
+        ));
+    }
+    Ok((component, version))
 }
 
 fn state_json(running: bool, pid: u32, protocol: u32, already_running: Option<bool>) -> Value {

@@ -4,4 +4,21 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
-description = "Gestor de runtimes. Sin implementación en la fase 0."
+description = "Catálogo, descarga y verificación de runtimes (ADR 0002)."
+
+[dependencies]
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.8"
+uuid = { version = "1", features = ["v4"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "hostig-verify-catalog"
+path = "src/bin/verify_catalog.rs"

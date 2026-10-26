@@ -1,0 +1,45 @@
+# Catálogo fijado de runtimes (ADR 0002). Cambiar URL o hash es un commit revisado.
+# Los SHA-256 de Windows x64 se contrastaron el 2026-10-22 contra el publicador:
+# - Apache: .txt SHA-256 de Apache Lounge (VS18) + archivo descargado
+# - PHP: releases.json de windows.php.net + archivo descargado
+# - MariaDB: sha256sums.txt de archive.mariadb.org + archivo descargado
+
+[[runtime]]
+component = "apache"
+version = "2.4.69"
+os = "windows"
+arch = "x86_64"
+urls = [
+  "https://www.apachelounge.com/download/VS18/binaries/httpd-2.4.69-261002-win64-VS18.zip",
+]
+filename = "httpd-2.4.69-261002-win64-VS18.zip"
+sha256 = "ca272e0b75abad78b1e4029a0753b20ff2232d2d857e8eebeea5d469c5776977"
+license = "Apache-2.0"
+notes = "ZIP Win64 de Apache Lounge (VS18 / Visual Studio C++ 2026), no binario de la ASF. Exige el redistribuible VC++ 14.51+ (etiqueta Visual Studio 2017-2026). El ZIP no incluye esas DLL: el ADR 0002 manda llevarlas en la carpeta del runtime junto a httpd.exe (copia local desde el redistribuible, sin ejecutar vc_redist)."
+
+[[runtime]]
+component = "php"
+version = "8.4.27"
+os = "windows"
+arch = "x86_64"
+urls = [
+  "https://windows.php.net/downloads/releases/php-8.4.27-nts-Win32-vs17-x64.zip",
+  "https://windows.php.net/downloads/releases/archives/php-8.4.27-nts-Win32-vs17-x64.zip",
+]
+filename = "php-8.4.27-nts-Win32-vs17-x64.zip"
+sha256 = "93bd8a815a52156606fb906d0573437908c61f96e2cc52c03a51e36a41bf5236"
+license = "PHP-3.01"
+notes = "ZIP NTS x64 oficial (VS17). Pensado para FastCGI (php-cgi), no mod_php. Compatible en proceso aparte con httpd VS18 (ADR 0005 FastCGI)."
+
+[[runtime]]
+component = "mariadb"
+version = "11.4.13"
+os = "windows"
+arch = "x86_64"
+urls = [
+  "https://archive.mariadb.org/mariadb-11.4.13/winx64-packages/mariadb-11.4.13-winx64.zip",
+]
+filename = "mariadb-11.4.13-winx64.zip"
+sha256 = "d62986d433eeebfde218560b276103831604a61e929e87f1a17f5aebd80257e2"
+license = "GPL-2.0-only"
+notes = "ZIP winx64 oficial de mariadb.org. No usar el MSI (registra servicio de Windows)."

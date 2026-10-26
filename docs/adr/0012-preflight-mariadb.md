@@ -1,7 +1,8 @@
 # ADR 0012 — Preflight y plazos de arranque de MariaDB
 
-- Estado: Propuesto
+- Estado: Aceptado
 - Fecha: 2026-10-21
+- Aceptado por el equipo: 2026-10-21
 
 ## Contexto
 

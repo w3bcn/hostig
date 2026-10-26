@@ -31,6 +31,14 @@ El hash mínimo aceptado en el catálogo es SHA-256. Si el publicador solo ofrec
 
 La descarga llega a un temporal. Se calcula el hash. Si no coincide, se borra el temporal y se registra el error con la acción «volver a descargar o revisar el catálogo». Solo entonces se descomprime en un directorio nuevo y se renombra a la ruta final.
 
+### Vigilancia del catálogo
+
+Cuando el workflow semanal detecte una URL retirada o un hash que ya no coincide, la respuesta es actualizar `catalog/runtimes.toml` a la build vigente en un pull request revisado. No se guardan copias propias de binarios de terceros como respaldo: el instalador no redistribuye Apache, PHP ni MariaDB ([ADR 0009](0009-licencia.md)).
+
+### Extracción en Unix (fase 1b)
+
+En Linux y macOS la extracción del paquete deberá conservar los bits de ejecución de los binarios. Eso no se implementa en la fase 1 (Windows); queda como requisito de la 1b/1c.
+
 ### Dónde viven
 
 Nunca en una ruta de sistema. Raíz de datos:

@@ -134,7 +134,7 @@ El código del sitio queda en la carpeta que elija la persona. El socket del sup
 | [0009](adr/0009-licencia.md) | Apache-2.0. Sin binarios de terceros en el instalador | Aceptado |
 | [0010](adr/0010-distribucion.md) | CI en los tres sistemas desde el principio. Firma de Windows primero. Runtimes en un pipeline aparte | Aceptado |
 | [0011](adr/0011-apagado-del-sistema.md) | Apagado, cierre de sesión y suspensión. Parada rápida sin volcado. Sin job que mate a MariaDB | Aceptado |
-| [0012](adr/0012-preflight-mariadb.md) | Preflight del datadir MariaDB, cuarentena y plazos de arranque (cuelgue vs recuperación) | Propuesto |
+| [0012](adr/0012-preflight-mariadb.md) | Preflight del datadir MariaDB, cuarentena y plazos de arranque (cuelgue vs recuperación) | Aceptado |
 
 
 ### Fuentes de los runtimes

@@ -64,13 +64,25 @@ pub struct Client;
 impl Client {
     pub fn status(layout: &Layout) -> Result<Status, ClientError> {
         let token = load_or_create_token(&layout.token_path)?;
-        let raw = call(layout, &token, PROTOCOL_VERSION, "status")?;
+        let raw = call(
+            layout,
+            &token,
+            PROTOCOL_VERSION,
+            "status",
+            serde_json::json!({}),
+        )?;
         Ok(protocol::parse_status(&raw)?)
     }
 
     pub fn shutdown(layout: &Layout) -> Result<(), ClientError> {
         let token = load_or_create_token(&layout.token_path)?;
-        let raw = call(layout, &token, PROTOCOL_VERSION, "shutdown")?;
+        let raw = call(
+            layout,
+            &token,
+            PROTOCOL_VERSION,
+            "shutdown",
+            serde_json::json!({}),
+        )?;
         check_success(&raw)
     }
 
@@ -79,13 +91,24 @@ impl Client {
         token: &str,
         protocol: u32,
     ) -> Result<(), ClientError> {
-        let raw = call(layout, token, protocol, "handshake")?;
+        let raw = call(layout, token, protocol, "handshake", serde_json::json!({}))?;
         check_success(&raw)
     }
 
     pub fn connect(layout: &Layout) -> Result<(), ClientError> {
         let token = load_or_create_token(&layout.token_path)?;
         Self::connect_with_token(layout, &token, PROTOCOL_VERSION)
+    }
+
+    /// Petición JSON-RPC genérica. `extra` se fusiona con protocol y token.
+    pub fn call(
+        layout: &Layout,
+        method: &str,
+        extra: serde_json::Value,
+    ) -> Result<serde_json::Value, ClientError> {
+        let token = load_or_create_token(&layout.token_path)?;
+        let raw = call(layout, &token, PROTOCOL_VERSION, method, extra)?;
+        parse_result(&raw)
     }
 }
 
@@ -101,17 +124,21 @@ fn map_connect_error(error: std::io::Error) -> ClientError {
     }
 }
 
-fn call(layout: &Layout, token: &str, protocol: u32, method: &str) -> Result<Vec<u8>, ClientError> {
+fn call(
+    layout: &Layout,
+    token: &str,
+    protocol: u32,
+    method: &str,
+    extra: serde_json::Value,
+) -> Result<Vec<u8>, ClientError> {
     let mut stream = connect_raw(layout).map_err(map_connect_error)?;
-    write_frame(
-        &mut stream,
-        &protocol::request(
-            1,
-            method,
-            serde_json::json!({ "protocol": protocol, "token": token }),
-        ),
-    )
-    .map_err(FrameError::into_io)?;
+    let mut params = serde_json::json!({ "protocol": protocol, "token": token });
+    if let Some(map) = extra.as_object() {
+        for (key, value) in map {
+            params[key] = value.clone();
+        }
+    }
+    write_frame(&mut stream, &protocol::request(1, method, params)).map_err(FrameError::into_io)?;
     // Un solo handle: write+read. Duplicar el named pipe en Windows dejaba
     // wait_for_close del servidor bloqueado hasta el último CloseHandle.
     let raw = read_frame(&mut stream).map_err(FrameError::into_io)?;
@@ -120,6 +147,10 @@ fn call(layout: &Layout, token: &str, protocol: u32, method: &str) -> Result<Vec
 }
 
 fn check_success(raw: &[u8]) -> Result<(), ClientError> {
+    parse_result(raw).map(|_| ())
+}
+
+fn parse_result(raw: &[u8]) -> Result<serde_json::Value, ClientError> {
     let value: serde_json::Value = serde_json::from_slice(raw).map_err(|error| {
         ClientError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     })?;
@@ -130,7 +161,10 @@ fn check_success(raw: &[u8]) -> Result<(), ClientError> {
             action: protocol::rpc_action(&value),
         });
     }
-    Ok(())
+    Ok(value
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null))
 }
 
 /// `true` si el pid sigue en marcha. Un pid 0 no lo está.

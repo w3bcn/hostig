@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 hostig-ipc = { path = "../ipc" }
+hostig-runtimes = { path = "../runtimes" }
 serde_json = "1"
 time = { version = "0.3", features = ["formatting"] }
 

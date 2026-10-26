@@ -15,7 +15,7 @@ Cada archivo es una decisión. El mapa de módulos, la estructura del repositori
 | [0009](0009-licencia.md) | Aceptado | Apache-2.0, con `LICENSE` y `NOTICE`. |
 | [0010](0010-distribucion.md) | Aceptado | CI en los tres sistemas desde el principio. Firma de Windows primero. Los runtimes no van dentro del instalador. |
 | [0011](0011-apagado-del-sistema.md) | Aceptado | Aviso de apagado, cierre de sesión y suspensión. Parada rápida sin volcado. MariaDB no muere si muere el supervisor. |
-| [0012](0012-preflight-mariadb.md) | Propuesto | Preflight del datadir, cuarentena de replicación anómala y plazos de arranque de MariaDB (cuelgue vs recuperación activa). |
+| [0012](0012-preflight-mariadb.md) | Aceptado | Preflight del datadir, cuarentena de replicación anómala y plazos de arranque de MariaDB (cuelgue vs recuperación activa). |
 
 
 Las cinco decisiones que estaban abiertas quedan confirmadas al final de la arquitectura. El límite de identidad de Azure Trusted Signing está en el [ADR 0010](0010-distribucion.md).

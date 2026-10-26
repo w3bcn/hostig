@@ -8,6 +8,7 @@ use hostig_ipc::{
     tokens_match, write_frame, ByteStream, FrameError, Layout, Listener, MAX_FRAME_LEN,
     PROTOCOL_VERSION,
 };
+use hostig_runtimes::{clean_tmp_runtimes, RuntimeService};
 use serde_json::{json, Value};
 
 use crate::lock::Lock;
@@ -21,6 +22,31 @@ const MAX_SESSIONS: usize = 32;
 pub fn serve(layout: &Layout, log: &Logger, _lock: Lock) -> std::io::Result<()> {
     let token = load_or_create_token(&layout.token_path)?;
     std::fs::write(layout.pid_path.as_path(), std::process::id().to_string())?;
+    match clean_tmp_runtimes(&layout.data_dir) {
+        Ok(0) => {}
+        Ok(n) => log.info("runtimes", &format!("limpiados {n} restos en tmp/runtimes")),
+        Err(error) => log.error(
+            "runtimes",
+            "no se pudo limpiar tmp/runtimes",
+            &error.to_string(),
+            "borra a mano {datos}/tmp/runtimes si queda basura de una instalación cortada",
+        ),
+    }
+    let runtimes = match RuntimeService::with_embedded(&layout.data_dir) {
+        Ok(service) => Arc::new(service),
+        Err(error) => {
+            log.error(
+                "runtimes",
+                "no se pudo cargar el catálogo",
+                &error.cause,
+                &error.action,
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error.to_string(),
+            ));
+        }
+    };
     let listener = listen(layout)?;
     log.info(
         "supervisor",
@@ -28,7 +54,9 @@ pub fn serve(layout: &Layout, log: &Logger, _lock: Lock) -> std::io::Result<()> 
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let active = Arc::new(AtomicUsize::new(0));
-    let result = accept_loop(&listener, layout, &token, log, &shutdown, &active);
+    let result = accept_loop(
+        &listener, layout, &token, log, &shutdown, &active, &runtimes,
+    );
     wait_for_sessions(&active, Duration::from_secs(6));
     let _ = std::fs::remove_file(&layout.pid_path);
     if let hostig_ipc::Endpoint::Unix(path) = &layout.endpoint {
@@ -45,6 +73,7 @@ fn accept_loop(
     log: &Logger,
     shutdown: &Arc<AtomicBool>,
     active: &Arc<AtomicUsize>,
+    runtimes: &Arc<RuntimeService>,
 ) -> std::io::Result<()> {
     let token = Arc::new(token.to_string());
     let log = log.clone();
@@ -79,10 +108,11 @@ fn accept_loop(
         let log = log.clone();
         let shutdown = Arc::clone(shutdown);
         let active = Arc::clone(active);
+        let runtimes = Arc::clone(runtimes);
         let wake_layout = layout.clone();
         active.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
-            let outcome = session(stream, &token, &log, &shutdown);
+            let outcome = session(stream, &token, &log, &shutdown, &runtimes);
             if shutdown.load(Ordering::SeqCst) {
                 wake_accept(&wake_layout);
             }
@@ -118,6 +148,7 @@ fn session(
     token: &str,
     log: &Logger,
     shutdown: &AtomicBool,
+    runtimes: &RuntimeService,
 ) -> std::io::Result<()> {
     let first = match read_frame_timed(&mut stream, log, "el cliente no envió su mensaje a tiempo")
     {
@@ -184,18 +215,129 @@ fn session(
                 &protocol_success(id, json!({ "stopping": true })),
             )?;
         }
+        "runtimes.list" => {
+            let list = runtimes.list();
+            write_frame(
+                &mut stream,
+                &protocol_success(id, json!({ "runtimes": list })),
+            )?;
+        }
+        "runtimes.install" => match handle_runtimes_install(runtimes, &request, log) {
+            Ok(status) => {
+                write_frame(&mut stream, &protocol_success(id, json!(status)))?;
+            }
+            Err((message, cause, action)) => {
+                reply_error(&mut stream, id, -32010, &message, &cause, &action)?;
+            }
+        },
+        "runtimes.job" => match handle_runtimes_job(runtimes, &request) {
+            Ok(status) => {
+                write_frame(&mut stream, &protocol_success(id, json!(status)))?;
+            }
+            Err((message, cause, action)) => {
+                reply_error(&mut stream, id, -32011, &message, &cause, &action)?;
+            }
+        },
+        "runtimes.verify" => match handle_runtimes_verify(runtimes, &request, log) {
+            Ok(rows) => {
+                write_frame(
+                    &mut stream,
+                    &protocol_success(id, json!({ "results": rows })),
+                )?;
+            }
+            Err((message, cause, action)) => {
+                reply_error(&mut stream, id, -32012, &message, &cause, &action)?;
+            }
+        },
         other => {
             reply_error(
                 &mut stream,
                 id,
                 -32601,
-                "método no implementado en la fase 0",
-                &format!("el método {other} no existe todavía"),
-                "usa status o shutdown",
+                "método desconocido",
+                &format!("el método {other} no existe"),
+                "usa status, shutdown o runtimes.*",
             )?;
         }
     }
     wait_for_close_timed(&mut stream, log)
+}
+
+fn handle_runtimes_install(
+    runtimes: &RuntimeService,
+    request: &Value,
+    log: &Logger,
+) -> Result<hostig_runtimes::JobStatus, (String, String, String)> {
+    let component = request
+        .pointer("/params/component")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let version = request
+        .pointer("/params/version")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if component.is_empty() || version.is_empty() {
+        return Err((
+            "parámetros incompletos".into(),
+            "faltan component o version".into(),
+            "usa component@version, por ejemplo php@8.4.27".into(),
+        ));
+    }
+    match runtimes.start_install(component, version) {
+        Ok(status) => Ok(status),
+        Err(error) => {
+            log.error("runtimes", &error.message, &error.cause, &error.action);
+            Err((error.message, error.cause, error.action))
+        }
+    }
+}
+
+fn handle_runtimes_job(
+    runtimes: &RuntimeService,
+    request: &Value,
+) -> Result<hostig_runtimes::JobStatus, (String, String, String)> {
+    let job_id = request
+        .pointer("/params/job_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if job_id.is_empty() {
+        return Err((
+            "parámetros incompletos".into(),
+            "falta job_id".into(),
+            "usa el id que devolvió runtimes.install".into(),
+        ));
+    }
+    runtimes
+        .job(job_id)
+        .map_err(|error| (error.message, error.cause, error.action))
+}
+
+fn handle_runtimes_verify(
+    runtimes: &RuntimeService,
+    request: &Value,
+    log: &Logger,
+) -> Result<Vec<hostig_runtimes::VerifyRow>, (String, String, String)> {
+    let component = request.pointer("/params/component").and_then(Value::as_str);
+    let version = request.pointer("/params/version").and_then(Value::as_str);
+    match runtimes.verify(component, version) {
+        Ok(rows) => {
+            for row in &rows {
+                if !row.ok {
+                    log.error(
+                        "runtimes",
+                        "verificación fallida",
+                        &row.detail,
+                        "reinstala el runtime afectado",
+                    );
+                }
+            }
+            Ok(rows)
+        }
+        Err(error) => {
+            log.error("runtimes", &error.message, &error.cause, &error.action);
+            Err((error.message, error.cause, error.action))
+        }
+    }
 }
 
 fn read_frame_timed(
