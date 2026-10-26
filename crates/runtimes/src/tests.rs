@@ -364,15 +364,24 @@ fn spawn_drip_server(
 
 #[test]
 fn descarga_lenta_continua_no_se_corta_por_inactividad() {
+    // 40 trozos × 80 ms ≈ 3,2 s > idle 500 ms: si el timeout de lectura de
+    // reqwest se interpretara como tope total, esta descarga fallaría.
     let body = vec![b'x'; 40];
-    let url = spawn_drip_server(body.clone(), 8, Duration::from_millis(80), None);
+    let url = spawn_drip_server(body.clone(), 1, Duration::from_millis(80), None);
     let dir = tempdir().unwrap();
     let dest = dir.path().join("slow.bin");
     let timeouts = DownloadTimeouts {
         idle: Duration::from_millis(500),
         total: Duration::from_secs(30),
     };
+    let started = std::time::Instant::now();
     let hash = download_to_file_with(&url, &dest, timeouts).unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed > timeouts.idle,
+        "la descarga debería durar más que el idle ({elapsed:?} ≤ {:?})",
+        timeouts.idle
+    );
     assert_eq!(hash, sha256_bytes(&body));
     assert_eq!(std::fs::read(&dest).unwrap(), body);
 }
