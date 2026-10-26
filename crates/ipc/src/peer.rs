@@ -12,13 +12,20 @@ pub fn process_is_running(pid: u32) -> bool {
         return false;
     }
     use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // STILL_ACTIVE (259): OpenProcess sigue bastando mientras quede algún handle
+    // (p. ej. Child del supervisor); hay que mirar el código de salida.
+    const STILL_ACTIVE: u32 = 259;
     unsafe {
         let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
             return false;
         };
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(handle, &mut code);
         let _ = CloseHandle(handle);
-        true
+        ok.is_ok() && code == STILL_ACTIVE
     }
 }
 
@@ -83,6 +90,15 @@ fn macos_fd_count(pid: u32) -> std::io::Result<u32> {
         }
         buf.resize(buf.len() * 2, 0);
     }
+}
+
+/// Restringe el archivo al usuario actual (y SYSTEM en Windows). Misma política que `auth.token`.
+#[cfg(unix)]
+pub fn restrict_to_user_and_system(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(path, perms)
 }
 
 #[cfg(windows)]

@@ -479,6 +479,17 @@ dependencies = [
 [[package]]
 name = "hostig-processes"
 version = "0.1.0"
+dependencies = [
+ "hostig-ipc",
+ "hostig-ports",
+ "hostig-runtimes",
+ "nix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+ "windows",
+]
 
 [[package]]
 name = "hostig-projects"
@@ -505,6 +516,7 @@ version = "0.1.0"
 dependencies = [
  "hostig-ipc",
  "hostig-ports",
+ "hostig-processes",
  "hostig-runtimes",
  "nix",
  "serde_json",

@@ -1,0 +1,25 @@
+# Generado por Hostig. No editar a mano: se regenera (ADR 0005).
+# Instancia: {{INSTANCE_ID}}
+
+[mysqld]
+port={{PORT}}
+bind-address=127.0.0.1
+datadir={{DATADIR}}
+basedir={{BASEDIR}}
+log-error={{ERROR_LOG}}
+pid-file={{PID_FILE}}
+skip-name-resolve
+skip-slave-start
+character-set-server=utf8mb4
+collation-server=utf8mb4_unicode_ci
+innodb_buffer_pool_size=128M
+innodb_log_file_size=48M
+innodb_flush_log_at_trx_commit=1
+innodb_doublewrite=1
+max_connections=50
+
+[client]
+protocol=tcp
+host=127.0.0.1
+port={{PORT}}
+default-character-set=utf8mb4
