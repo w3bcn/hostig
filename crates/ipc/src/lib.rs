@@ -14,6 +14,7 @@ mod transport;
 
 pub use frame::{read_frame, write_frame, FrameError, MAX_FRAME_LEN};
 pub use paths::{default_data_dir, Endpoint, Layout};
+pub use peer::restrict_to_user_and_system;
 pub use protocol::success as protocol_success;
 pub use protocol::{
     error_response, rpc_action, rpc_cause, rpc_message, Handshake, Status, PROTOCOL_VERSION,

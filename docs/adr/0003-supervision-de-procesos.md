@@ -26,6 +26,8 @@ Orden: MariaDB, PHP (el pool del proyecto o el pool único del MVP), Apache. Apa
 
 MariaDB se inicializa la primera vez con `mariadb-install-db` sobre un datadir vacío dentro de `{datos}/instances/{id}/`. Se genera una contraseña de la cuenta de administración y se guarda con permisos de usuario (archivo `0600` en el directorio de la instancia; en una fase posterior, el llavero del sistema). No se reutiliza la raíz sin contraseña de XAMPP.
 
+En Windows, `mariadb-install-db` recibe esa contraseña por línea de comandos (`--password=...`) solo durante la inicialización. Queda visible unos segundos para el mismo usuario y para administradores que listen el proceso; no es el camino de `mariadb-admin` (que usa un archivo de opciones protegido). En Linux cualquier usuario puede leer las líneas de comandos de otros procesos, así que la fase 1b necesitará otro mecanismo (p. ej. opciones en archivo o entrada sin argv).
+
 El proceso se lanza con el ejecutable absoluto del runtime y un archivo de configuración generado. No se hereda un `PATH` modificado del sistema.
 
 ### Health checks

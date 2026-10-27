@@ -17,8 +17,17 @@ path = "src/bin/hostig-supervisor.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 hostig-ipc = { path = "../../crates/ipc" }
+hostig-processes = { path = "../../crates/processes" }
 hostig-supervisor = { path = "../../crates/supervisor" }
 serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
+hostig-ports = { path = "../../crates/ports" }
+hostig-runtimes = { path = "../../crates/runtimes" }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
