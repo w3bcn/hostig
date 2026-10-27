@@ -92,12 +92,24 @@ fn macos_process_is_running(pid: u32) -> bool {
 
 /// Resultado de sysctl(KERN_PROC_PID) → kp_proc.p_stat (vía helper C con kinfo_proc).
 #[cfg(target_os = "macos")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum MacosProcState {
     Running { p_stat: i8 },
     Zombie { p_stat: i8 },
     Gone,
     QueryFailed { errno: i32 },
+}
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Debug for MacosProcState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Running { p_stat } => write!(f, "Running {{ p_stat={p_stat} }}"),
+            Self::Zombie { p_stat } => write!(f, "Zombie {{ p_stat={p_stat} }}"),
+            Self::Gone => write!(f, "Gone"),
+            Self::QueryFailed { errno } => write!(f, "QueryFailed {{ errno={errno} }}"),
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
