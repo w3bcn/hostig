@@ -181,6 +181,12 @@ pub fn process_liveness_detail(pid: u32) -> String {
     peer::process_liveness_detail(pid)
 }
 
+/// Hora de arranque del proceso en epoch ms (macOS: sysctl KERN_PROC_PID).
+#[cfg(target_os = "macos")]
+pub fn macos_process_start_ms(pid: u32) -> Option<u64> {
+    peer::macos_process_start_ms(pid)
+}
+
 /// Descriptores o handles abiertos del proceso (para tests de fuga).
 pub fn process_open_resources(pid: u32) -> std::io::Result<u32> {
     peer::process_open_resources(pid)

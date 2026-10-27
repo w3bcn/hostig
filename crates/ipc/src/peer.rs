@@ -113,14 +113,22 @@ impl std::fmt::Debug for MacosProcState {
 }
 
 #[cfg(target_os = "macos")]
+mod macos_sysctl {
+    extern "C" {
+        pub fn hostig_macos_proc_p_stat(
+            pid: libc::c_int,
+            out_stat: *mut libc::c_char,
+        ) -> libc::c_int;
+        pub fn hostig_macos_proc_start_ms(pid: libc::c_int, out_ms: *mut u64) -> libc::c_int;
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn macos_proc_state(pid: u32) -> MacosProcState {
     // libc no exporta kinfo_proc en Apple; el helper C usa <sys/sysctl.h>
     // con sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid) y kp_proc.p_stat.
-    extern "C" {
-        fn hostig_macos_proc_p_stat(pid: libc::c_int, out_stat: *mut libc::c_char) -> libc::c_int;
-    }
     let mut p_stat: libc::c_char = 0;
-    let rc = unsafe { hostig_macos_proc_p_stat(pid as libc::c_int, &mut p_stat) };
+    let rc = unsafe { macos_sysctl::hostig_macos_proc_p_stat(pid as libc::c_int, &mut p_stat) };
     if rc == 0 {
         let p_stat = p_stat as i8;
         // SZOMB de <sys/proc.h>, también en libc::SZOMB.
@@ -138,6 +146,18 @@ fn macos_proc_state(pid: u32) -> MacosProcState {
         "{{\"level\":\"error\",\"module\":\"ipc\",\"message\":\"sysctl KERN_PROC_PID falló\",\"cause\":\"pid={pid} errno={errno} ({err})\",\"action\":\"no se afirma que el proceso viva; revisa permisos o el estado del kernel\"}}"
     );
     MacosProcState::QueryFailed { errno }
+}
+
+/// Hora de arranque del proceso en epoch ms (sysctl → p_starttime). Solo macOS.
+#[cfg(target_os = "macos")]
+pub fn macos_process_start_ms(pid: u32) -> Option<u64> {
+    let mut ms = 0u64;
+    let rc = unsafe { macos_sysctl::hostig_macos_proc_start_ms(pid as libc::c_int, &mut ms) };
+    if rc == 0 {
+        Some(ms)
+    } else {
+        None
+    }
 }
 
 /// Detalle de liveness para mensajes de test / diagnóstico.

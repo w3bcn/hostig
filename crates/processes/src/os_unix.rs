@@ -12,10 +12,7 @@ pub fn process_creation_time(pid: u32) -> Option<u64> {
     }
     #[cfg(target_os = "macos")]
     {
-        // Aproximación: usamos el inode de /proc no disponible; leemos via libproc no aquí.
-        // Para adopción en macOS (fase 1c) se refinará. Por ahora, mtime del exe + pid.
-        let _ = pid;
-        None
+        hostig_ipc::macos_process_start_ms(pid)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
