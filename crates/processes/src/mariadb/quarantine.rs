@@ -137,7 +137,7 @@ pub fn restore_quarantine(paths: &InstancePaths, timestamp: &str) -> Result<Quar
             return Err(ProcessError::new(
                 "no se puede restaurar",
                 format!("{} ya existe", entry.original.display()),
-                "mueve o borra el archivo destino y reintenta",
+                "muévelo o revísalo a mano antes de restaurar",
             ));
         }
         fs::rename(&src, &entry.original)?;
@@ -178,5 +178,34 @@ mod tests {
         ));
         restore_quarantine(&paths, &m.timestamp).unwrap();
         assert!(bad.exists());
+    }
+
+    #[test]
+    fn restore_no_sobrescribe_si_ya_existe() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = InstancePaths::new(dir.path(), "t");
+        paths.ensure_dirs().unwrap();
+        let bad = paths.datadir.join("multi-master.info");
+        fs::write(&bad, "2026-01-01 [Note] bad\n").unwrap();
+        let m = quarantine_detected(&paths).unwrap();
+        assert!(!bad.exists());
+        // Alguien vuelve a crear el archivo en la ruta original.
+        fs::write(&bad, "otro contenido\n").unwrap();
+        let err = restore_quarantine(&paths, &m.timestamp).expect_err("no sobrescribir");
+        assert!(err.cause.contains("ya existe"), "cause={}", err.cause);
+        assert!(
+            err.action.contains("mano") || err.action.contains("muévelo"),
+            "action={}",
+            err.action
+        );
+        // El archivo en destino no se tocó.
+        assert_eq!(fs::read_to_string(&bad).unwrap().trim(), "otro contenido");
+        // Y lo cuarentenado sigue en quarantine.
+        let stored = paths
+            .root
+            .join("quarantine")
+            .join(&m.timestamp)
+            .join("00_multi-master.info");
+        assert!(stored.is_file());
     }
 }

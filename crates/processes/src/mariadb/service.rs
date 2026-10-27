@@ -782,7 +782,24 @@ impl DbService {
                     continue;
                 }
                 let Some(pid) = pid else { continue };
-                if !hostig_ipc::process_is_running(pid) {
+                // Recoger el Child si ya salió: evita zombies (Unix) y handles
+                // abiertos que enmascaran la muerte (Windows).
+                let child_exited = {
+                    let mut inner = service.inner.lock().expect("db inner");
+                    if let Some(child) = inner.child.as_mut() {
+                        match child.try_wait() {
+                            Ok(Some(_)) => {
+                                let _ = inner.child.take();
+                                true
+                            }
+                            Ok(None) => false,
+                            Err(_) => false,
+                        }
+                    } else {
+                        false
+                    }
+                };
+                if child_exited || !hostig_ipc::process_is_running(pid) {
                     // Muerte inesperada → backoff.
                     if let Err(error) = service.handle_unexpected_death(&id, port, &version) {
                         let mut inner = service.inner.lock().expect("db inner");
