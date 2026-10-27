@@ -168,7 +168,10 @@ fn parse_result(raw: &[u8]) -> Result<serde_json::Value, ClientError> {
         .unwrap_or(serde_json::Value::Null))
 }
 
-/// `true` si el pid sigue en marcha. Un pid 0 no lo está.
+/// `true` si el pid sigue en marcha de verdad.
+///
+/// Zombies (Unix) y procesos ya salidos con handle abierto (Windows) no cuentan.
+/// Un pid 0 no está vivo.
 pub fn process_is_running(pid: u32) -> bool {
     peer::process_is_running(pid)
 }

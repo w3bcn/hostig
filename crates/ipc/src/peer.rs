@@ -1,32 +1,131 @@
-#[cfg(unix)]
+//! Consulta de procesos del sistema (vivo / zombie / salido).
+
+/// `true` solo si el proceso sigue en ejecución real.
+///
+/// Un zombie (Unix) o un proceso ya salido cuyo handle sigue abierto (Windows)
+/// no cuenta como vivo: `kill(pid, 0)` / `OpenProcess` bastan para ver la
+/// entrada, pero no para saber si aún corre.
 pub fn process_is_running(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+    #[cfg(windows)]
+    {
+        windows_process_is_running(pid)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_process_is_running(pid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_process_is_running(pid)
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        // Otros Unix: sin detección de zombie específica.
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+    }
 }
 
 #[cfg(windows)]
-pub fn process_is_running(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    use windows::Win32::Foundation::CloseHandle;
+fn windows_process_is_running(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        GetExitCodeProcess, OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_SYNCHRONIZE,
     };
-    // STILL_ACTIVE (259): OpenProcess sigue bastando mientras quede algún handle
-    // (p. ej. Child del supervisor); hay que mirar el código de salida.
+    // STILL_ACTIVE (259): un proceso puede salir con código 259; por eso
+    // cruzamos con WaitForSingleObject(0) — señalizado = ya terminó.
     const STILL_ACTIVE: u32 = 259;
     unsafe {
-        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+        let Ok(handle) = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        ) else {
             return false;
         };
+        let wait = WaitForSingleObject(handle, 0);
+        if wait == WAIT_OBJECT_0 {
+            let _ = CloseHandle(handle);
+            return false;
+        }
+        if wait != WAIT_TIMEOUT {
+            // Acceso denegado u otro: no afirmamos que vive.
+            let _ = CloseHandle(handle);
+            return false;
+        }
         let mut code = 0u32;
         let ok = GetExitCodeProcess(handle, &mut code);
         let _ = CloseHandle(handle);
         ok.is_ok() && code == STILL_ACTIVE
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_is_running(pid: u32) -> bool {
+    // kill(0) responde OK también para zombies; mirar el estado en /proc.
+    if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err() {
+        return false;
+    }
+    !linux_is_zombie(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_is_zombie(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // Formato: pid (comm) state ... — comm puede tener espacios y ')'.
+    let Some(close) = stat.rfind(')') else {
+        return false;
+    };
+    let rest = stat[close + 1..].trim_start();
+    rest.starts_with('Z')
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_is_running(pid: u32) -> bool {
+    if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err() {
+        return false;
+    }
+    !macos_is_zombie(pid)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_is_zombie(pid: u32) -> bool {
+    // PROC_PIDTBSDINFO: pbi_status == SZOMB (5) → zombie.
+    const PROC_PIDTBSDINFO: i32 = 3;
+    const SZOMB: u32 = 5;
+    // sizeof(struct proc_bsdinfo) en Darwin actual; el kernel exige el tamaño exacto.
+    // Campos al inicio: pbi_flags, pbi_status, … (solo leemos status).
+    #[repr(C)]
+    struct ProcBsdInfo {
+        pbi_flags: u32,
+        pbi_status: u32,
+        rest: [u8; 280],
+    }
+    let mut info = ProcBsdInfo {
+        pbi_flags: 0,
+        pbi_status: 0,
+        rest: [0; 280],
+    };
+    let size = std::mem::size_of::<ProcBsdInfo>() as i32;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            PROC_PIDTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        )
+    };
+    if written <= 0 {
+        // Sin info: no afirmamos zombie; kill(0) ya pasó — tratamos como vivo.
+        return false;
+    }
+    info.pbi_status == SZOMB
 }
 
 /// Descriptores (Unix) o handles (Windows) abiertos por el proceso.
@@ -222,6 +321,11 @@ fn io_err(error: windows::core::Error) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
+    use super::process_is_running;
+    use std::process::Command;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
     #[cfg(windows)]
     #[test]
     fn la_dacl_del_pipe_es_el_usuario_y_system() {
@@ -230,5 +334,39 @@ mod tests {
         assert!(sddl.contains(&super::current_user_sid().unwrap()));
         assert!(!sddl.contains("WD"));
         assert!(!sddl.contains("AU"));
+    }
+
+    /// Un hijo que termina y no se recoge (zombie / handle abierto) no cuenta como vivo.
+    #[test]
+    fn proceso_terminado_sin_reap_no_cuenta_como_vivo() {
+        let mut child = if cfg!(windows) {
+            Command::new("cmd")
+                .args(["/C", "exit", "0"])
+                .spawn()
+                .expect("spawn")
+        } else {
+            Command::new("true").spawn().expect("spawn")
+        };
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if !process_is_running(pid) {
+                // No llamamos a wait/reap todavía: el criterio debe valer igual.
+                assert!(
+                    !process_is_running(pid),
+                    "pid {pid} no debe contar como vivo tras salir"
+                );
+                let _ = child.wait();
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.wait();
+        panic!("pid {pid} seguía contando como vivo tras salir (¿zombie no detectado?)");
+    }
+
+    #[test]
+    fn pid_cero_no_esta_vivo() {
+        assert!(!process_is_running(0));
     }
 }
