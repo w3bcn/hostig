@@ -302,12 +302,12 @@ fn muerte_inesperada_reinicia_con_backoff_y_sexta_queda_en_error() {
     let _guard = test_lock();
     let tmp = tempfile::tempdir().unwrap();
     let paths = InstancePaths::new(tmp.path(), DEFAULT_INSTANCE_ID);
-    // Listo y muere enseguida → vigilancia reinicia.
-    write_script(&paths, "0 ready for connections.\nLISTEN\n80 EXIT 1\n");
-    // "80 EXIT 1" = esperar 80 ms y salir (el fake interpreta DELAY + EXIT).
+    // Listo, escucha un rato y muere → vigilancia reinicia.
+    // 400 ms da margen en CI macOS para ver ready+ping antes del EXIT.
+    write_script(&paths, "0 ready for connections.\nLISTEN\n400 EXIT 1\n");
     let settings = MariadbSettings {
         hang_secs: 3,
-        start_total_secs: 5,
+        start_total_secs: 8,
         health_interval_secs: 1,
         health_failures: 3,
         backoff_secs: vec![0, 0, 0, 0, 0],
