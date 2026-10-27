@@ -87,45 +87,73 @@ fn linux_is_zombie(pid: u32) -> bool {
 
 #[cfg(target_os = "macos")]
 fn macos_process_is_running(pid: u32) -> bool {
-    if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err() {
-        return false;
-    }
-    !macos_is_zombie(pid)
+    matches!(macos_proc_state(pid), MacosProcState::Running { .. })
+}
+
+/// Resultado de sysctl(KERN_PROC_PID) → kp_proc.p_stat (vía helper C con kinfo_proc).
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+enum MacosProcState {
+    Running { p_stat: i8 },
+    Zombie { p_stat: i8 },
+    Gone,
+    QueryFailed { errno: i32 },
 }
 
 #[cfg(target_os = "macos")]
-fn macos_is_zombie(pid: u32) -> bool {
-    // PROC_PIDTBSDINFO: pbi_status == SZOMB (5) → zombie.
-    const PROC_PIDTBSDINFO: i32 = 3;
-    const SZOMB: u32 = 5;
-    // sizeof(struct proc_bsdinfo) en Darwin actual; el kernel exige el tamaño exacto.
-    // Campos al inicio: pbi_flags, pbi_status, … (solo leemos status).
-    #[repr(C)]
-    struct ProcBsdInfo {
-        pbi_flags: u32,
-        pbi_status: u32,
-        rest: [u8; 280],
+fn macos_proc_state(pid: u32) -> MacosProcState {
+    // libc no exporta kinfo_proc en Apple; el helper C usa <sys/sysctl.h>
+    // con sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid) y kp_proc.p_stat.
+    extern "C" {
+        fn hostig_macos_proc_p_stat(pid: libc::c_int, out_stat: *mut libc::c_char) -> libc::c_int;
     }
-    let mut info = ProcBsdInfo {
-        pbi_flags: 0,
-        pbi_status: 0,
-        rest: [0; 280],
-    };
-    let size = std::mem::size_of::<ProcBsdInfo>() as i32;
-    let written = unsafe {
-        libc::proc_pidinfo(
-            pid as i32,
-            PROC_PIDTBSDINFO,
-            0,
-            std::ptr::addr_of_mut!(info).cast(),
-            size,
+    let mut p_stat: libc::c_char = 0;
+    let rc = unsafe { hostig_macos_proc_p_stat(pid as libc::c_int, &mut p_stat) };
+    if rc == 0 {
+        let p_stat = p_stat as i8;
+        // SZOMB de <sys/proc.h>, también en libc::SZOMB.
+        if p_stat as u32 == libc::SZOMB {
+            return MacosProcState::Zombie { p_stat };
+        }
+        return MacosProcState::Running { p_stat };
+    }
+    let err = std::io::Error::last_os_error();
+    let errno = err.raw_os_error().unwrap_or(0);
+    if errno == libc::ESRCH {
+        return MacosProcState::Gone;
+    }
+    eprintln!(
+        "{{\"level\":\"error\",\"module\":\"ipc\",\"message\":\"sysctl KERN_PROC_PID falló\",\"cause\":\"pid={pid} errno={errno} ({err})\",\"action\":\"no se afirma que el proceso viva; revisa permisos o el estado del kernel\"}}"
+    );
+    MacosProcState::QueryFailed { errno }
+}
+
+/// Detalle de liveness para mensajes de test / diagnóstico.
+pub fn process_liveness_detail(pid: u32) -> String {
+    if pid == 0 {
+        return "pid=0".into();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        format!("{:?}", macos_proc_state(pid))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let kill_ok = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok();
+        let zombie = linux_is_zombie(pid);
+        format!("linux kill_ok={kill_ok} zombie={zombie}")
+    }
+    #[cfg(windows)]
+    {
+        format!(
+            "windows process_is_running={}",
+            windows_process_is_running(pid)
         )
-    };
-    if written <= 0 {
-        // Sin info: no afirmamos zombie; kill(0) ya pasó — tratamos como vivo.
-        return false;
     }
-    info.pbi_status == SZOMB
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        format!("running={}", process_is_running(pid))
+    }
 }
 
 /// Descriptores (Unix) o handles (Windows) abiertos por el proceso.
@@ -339,6 +367,8 @@ mod tests {
     /// Un hijo que termina y no se recoge (zombie / handle abierto) no cuenta como vivo.
     #[test]
     fn proceso_terminado_sin_reap_no_cuenta_como_vivo() {
+        use super::process_liveness_detail;
+
         let mut child = if cfg!(windows) {
             Command::new("cmd")
                 .args(["/C", "exit", "0"])
@@ -352,17 +382,19 @@ mod tests {
         while Instant::now() < deadline {
             if !process_is_running(pid) {
                 // No llamamos a wait/reap todavía: el criterio debe valer igual.
+                let detail = process_liveness_detail(pid);
                 assert!(
                     !process_is_running(pid),
-                    "pid {pid} no debe contar como vivo tras salir"
+                    "pid {pid} no debe contar como vivo tras salir; consulta={detail}"
                 );
                 let _ = child.wait();
                 return;
             }
             thread::sleep(Duration::from_millis(20));
         }
+        let detail = process_liveness_detail(pid);
         let _ = child.wait();
-        panic!("pid {pid} seguía contando como vivo tras salir (¿zombie no detectado?)");
+        panic!("pid {pid} seguía contando como vivo tras salir; consulta del sistema: {detail}");
     }
 
     #[test]

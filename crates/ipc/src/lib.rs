@@ -176,6 +176,11 @@ pub fn process_is_running(pid: u32) -> bool {
     peer::process_is_running(pid)
 }
 
+/// Detalle de la consulta de liveness (para tests y diagnóstico en CI).
+pub fn process_liveness_detail(pid: u32) -> String {
+    peer::process_liveness_detail(pid)
+}
+
 /// Descriptores o handles abiertos del proceso (para tests de fuga).
 pub fn process_open_resources(pid: u32) -> std::io::Result<u32> {
     peer::process_open_resources(pid)
