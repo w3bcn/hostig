@@ -13,7 +13,7 @@ use hostig_processes::mariadb::{
     PreflightOutcome, StartRequest, DEFAULT_INSTANCE_ID, DEFAULT_MARIADB_VERSION,
     TEST_DB_PROBE_ENV, TEST_MARIADBD_ENV,
 };
-use hostig_processes::ALLOW_JOB_WITHOUT_BREAKAWAY_ENV;
+use hostig_processes::{ProcessRecord, ALLOW_JOB_WITHOUT_BREAKAWAY_ENV};
 
 fn test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -363,4 +363,44 @@ fn preflight_impide_arranque_con_multi_master_corrupto() {
         "{err:?}"
     );
     assert!(err.action.contains("quarantine") || err.action.contains("cuarentena"));
+}
+
+#[test]
+fn muerte_antes_de_ready_falla_al_momento_sin_registro() {
+    let _guard = test_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = InstancePaths::new(tmp.path(), DEFAULT_INSTANCE_ID);
+    // Sale a los 100 ms sin "ready" — no debe esperarse el hang (60 s / 1 s en test).
+    write_script(&paths, "0 Starting MariaDB\n100 EXIT 1\n");
+    let settings = MariadbSettings {
+        hang_secs: 60,
+        start_total_secs: 120,
+        ..short_settings()
+    };
+    let service = service_with_fake(tmp.path(), settings);
+    let port = free_port();
+    let started = Instant::now();
+    let job = start_and_wait(&service, port);
+    let elapsed = started.elapsed();
+    assert_eq!(job.state, "failed", "{job:?}");
+    let cause = job.error.expect("error").cause;
+    assert!(
+        cause.contains("terminó durante el arranque"),
+        "cause={cause}"
+    );
+    assert!(!cause.contains("colgado"), "no debe decir colgado: {cause}");
+    assert!(
+        !cause.contains("sigue registrado"),
+        "no debe decir sigue registrado: {cause}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "debió fallar al momento, tardó {elapsed:?}"
+    );
+    assert!(
+        ProcessRecord::load(tmp.path(), DEFAULT_INSTANCE_ID)
+            .expect("load")
+            .is_none(),
+        "no debe quedar registro de proceso"
+    );
 }

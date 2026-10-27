@@ -108,9 +108,20 @@ impl Default for StartRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReadyOutcome {
     Ready,
-    Hung { last_line: String },
-    TotalTimeout { last_line: String },
-    FatalLog { detail: String },
+    Hung {
+        last_line: String,
+    },
+    TotalTimeout {
+        last_line: String,
+    },
+    FatalLog {
+        detail: String,
+    },
+    /// El proceso murió antes de quedar listo (no es cuelgue).
+    Exited {
+        code: Option<i32>,
+        last_line: String,
+    },
 }
 
 struct Inner {
@@ -511,6 +522,7 @@ impl DbService {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let poll_child = || self.poll_child_exited(pid);
         match wait_until_ready(
             paths,
             request.port,
@@ -518,6 +530,7 @@ impl DbService {
             log_offset,
             &self.settings,
             started_unix,
+            poll_child,
         )? {
             ReadyOutcome::Ready => {
                 let mut inner = self.inner.lock().expect("db inner");
@@ -545,9 +558,7 @@ impl DbService {
                 pid,
                 ProcessError::new(
                     "MariaDB no quedó lista",
-                    format!(
-                        "tope total de arranque agotado; última línea: {last_line}"
-                    ),
+                    format!("tope total de arranque agotado; última línea: {last_line}"),
                     "revisa el error log; una recuperación InnoDB muy larga puede necesitar intervención",
                 ),
             )),
@@ -565,7 +576,64 @@ impl DbService {
                     ),
                 ))
             }
+            ReadyOutcome::Exited { code, last_line } => {
+                // Muerte durante el arranque: cuenta para el cupo de backoff (ADR 0003).
+                self.record_startup_death();
+                self.clear_dead_startup(&request.id, pid);
+                let code_s = code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".into());
+                Err(ProcessError::new(
+                    "MariaDB no quedó lista",
+                    format!(
+                        "MariaDB terminó durante el arranque (código de salida {code_s}); última línea del log: {last_line}"
+                    ),
+                    "revisa el error log; hostig db start tras corregir la causa",
+                ))
+            }
         }
+    }
+
+    /// `Some(code)` si el hijo ya no vive; `None` si sigue en marcha.
+    fn poll_child_exited(&self, pid: u32) -> Option<Option<i32>> {
+        let mut inner = self.inner.lock().expect("db inner");
+        if let Some(child) = inner.child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let code = status.code();
+                    let _ = inner.child.take();
+                    return Some(code);
+                }
+                Ok(None) => {}
+                Err(_) => {}
+            }
+        }
+        drop(inner);
+        if !hostig_ipc::process_is_running(pid) {
+            Some(None)
+        } else {
+            None
+        }
+    }
+
+    fn clear_dead_startup(&self, id: &str, _pid: u32) {
+        let _ = ProcessRecord::remove(&self.data_dir, id);
+        let mut inner = self.inner.lock().expect("db inner");
+        if let Some(mut child) = inner.child.take() {
+            let _ = child.try_wait();
+        }
+        inner.status.pid = None;
+    }
+
+    /// Registra una muerte durante el arranque en la ventana de backoff.
+    fn record_startup_death(&self) {
+        let mut inner = self.inner.lock().expect("db inner");
+        let now = Instant::now();
+        let window = self.settings.backoff_window();
+        inner
+            .restart_times
+            .retain(|t| now.duration_since(*t) < window);
+        inner.restart_times.push(now);
     }
 
     fn note_hang_line(&self, line: &str) {
@@ -612,6 +680,29 @@ impl DbService {
                 }
                 thread::sleep(Duration::from_millis(200));
             }
+        }
+        // Reapear por si murió sin ping (no afirmar "sigue registrado" si ya no vive).
+        {
+            let mut inner = self.inner.lock().expect("db inner");
+            if let Some(child) = inner.child.as_mut() {
+                let _ = child.try_wait();
+            }
+        }
+        if !hostig_ipc::process_is_running(pid) {
+            let _ = ProcessRecord::remove(&self.data_dir, id);
+            let mut inner = self.inner.lock().expect("db inner");
+            if let Some(mut child) = inner.child.take() {
+                let _ = child.wait();
+            }
+            inner.status.pid = None;
+            return ProcessError::new(
+                base.message,
+                format!(
+                    "{}; el proceso ya no está vivo (ping_ok={ping_ok})",
+                    base.cause
+                ),
+                base.action,
+            );
         }
         ProcessError::new(
             base.message,
@@ -961,6 +1052,16 @@ fn fs_remove_datadir_ini(paths: &InstancePaths) -> Result<()> {
     Ok(())
 }
 
+fn resolve_last_line(paths: &InstancePaths, last_line: &str) -> String {
+    if last_line != "(sin líneas todavía)" {
+        return last_line.to_string();
+    }
+    let full = read_log_since(&paths.error_log, 0).unwrap_or_default();
+    last_nonempty_line(&full)
+        .unwrap_or("(sin líneas todavía)")
+        .to_string()
+}
+
 fn wait_until_ready(
     paths: &InstancePaths,
     port: u16,
@@ -968,6 +1069,7 @@ fn wait_until_ready(
     log_offset: u64,
     settings: &MariadbSettings,
     started_unix: u64,
+    mut poll_exited: impl FnMut() -> Option<Option<i32>>,
 ) -> Result<ReadyOutcome> {
     let total_deadline = Instant::now() + settings.start_total();
     let mut last_len = 0u64;
@@ -977,6 +1079,12 @@ fn wait_until_ready(
     let mut warned_recovery = false;
 
     while Instant::now() < total_deadline {
+        if let Some(code) = poll_exited() {
+            return Ok(ReadyOutcome::Exited {
+                code,
+                last_line: resolve_last_line(paths, &last_line),
+            });
+        }
         let log = read_log_since(&paths.error_log, log_offset)?;
         let len = log.len() as u64;
         if len > last_len {
@@ -1014,21 +1122,24 @@ fn wait_until_ready(
             && !log_contains_ready(&log)
             && !probe_ready(paths, port, version).unwrap_or(false)
         {
-            // Si este tramo no aportó líneas (p. ej. reutilizar proceso colgado),
-            // citar la última línea real del error log (ADR 0012).
-            let hang_line = if last_line != "(sin líneas todavía)" {
-                last_line.clone()
-            } else {
-                let full = read_log_since(&paths.error_log, 0).unwrap_or_default();
-                last_nonempty_line(&full)
-                    .unwrap_or("(sin líneas todavía)")
-                    .to_string()
-            };
+            // Antes de declarar cuelgue, confirmar que el proceso sigue vivo.
+            if let Some(code) = poll_exited() {
+                return Ok(ReadyOutcome::Exited {
+                    code,
+                    last_line: resolve_last_line(paths, &last_line),
+                });
+            }
             return Ok(ReadyOutcome::Hung {
-                last_line: hang_line,
+                last_line: resolve_last_line(paths, &last_line),
             });
         }
         thread::sleep(Duration::from_millis(50));
+    }
+    if let Some(code) = poll_exited() {
+        return Ok(ReadyOutcome::Exited {
+            code,
+            last_line: resolve_last_line(paths, &last_line),
+        });
     }
     Ok(ReadyOutcome::TotalTimeout { last_line })
 }
