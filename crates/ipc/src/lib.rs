@@ -168,9 +168,23 @@ fn parse_result(raw: &[u8]) -> Result<serde_json::Value, ClientError> {
         .unwrap_or(serde_json::Value::Null))
 }
 
-/// `true` si el pid sigue en marcha. Un pid 0 no lo está.
+/// `true` si el pid sigue en marcha de verdad.
+///
+/// Zombies (Unix) y procesos ya salidos con handle abierto (Windows) no cuentan.
+/// Un pid 0 no está vivo.
 pub fn process_is_running(pid: u32) -> bool {
     peer::process_is_running(pid)
+}
+
+/// Detalle de la consulta de liveness (para tests y diagnóstico en CI).
+pub fn process_liveness_detail(pid: u32) -> String {
+    peer::process_liveness_detail(pid)
+}
+
+/// Hora de arranque del proceso en epoch ms (macOS: sysctl KERN_PROC_PID).
+#[cfg(target_os = "macos")]
+pub fn macos_process_start_ms(pid: u32) -> Option<u64> {
+    peer::macos_process_start_ms(pid)
 }
 
 /// Descriptores o handles abiertos del proceso (para tests de fuga).

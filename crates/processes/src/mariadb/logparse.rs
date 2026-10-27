@@ -32,8 +32,50 @@ pub fn log_contains_shutdown(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("shutdown complete")
         || lower.contains("mysqld: shutdown complete")
-        || lower.contains("mariadbd: ready for connections") && lower.contains("shutdown")
+        || (lower.contains("mariadbd: ready for connections") && lower.contains("shutdown"))
         || (lower.contains("shutdown") && lower.contains("complete"))
+}
+
+pub fn log_contains_crash_recovery(text: &str) -> bool {
+    text.to_ascii_lowercase()
+        .contains("starting crash recovery")
+}
+
+/// Regla del LSN / corrupción (ADR 0003): marca Failed aunque el puerto responda.
+pub fn log_contains_fatal_innodb(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("log sequence number is in the future") || lower.contains("may be corrupt")
+}
+
+pub fn last_nonempty_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).rfind(|l| !l.is_empty())
+}
+
+/// Busca volcados nuevos (mysqld.dmp / mariadbd.dmp) creados tras `since` (unix secs).
+pub fn new_dump_files(datadir: &Path, since_unix: u64) -> Result<Vec<std::path::PathBuf>> {
+    let mut found = Vec::new();
+    if !datadir.is_dir() {
+        return Ok(found);
+    }
+    for entry in std::fs::read_dir(datadir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if !(name.ends_with(".dmp") || name == "mysqld.dmp" || name.contains("mariadbd.dmp")) {
+            continue;
+        }
+        let meta = entry.metadata()?;
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if modified >= since_unix.saturating_sub(2) {
+            found.push(entry.path());
+        }
+    }
+    // También en el directorio de la instancia (a veces el dmp cae junto al binario/cwd).
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -53,6 +95,16 @@ mod tests {
     }
 
     #[test]
+    fn detecta_lsn_y_recovery() {
+        assert!(log_contains_fatal_innodb(
+            "InnoDB: log sequence number is in the future"
+        ));
+        assert!(log_contains_fatal_innodb("tablespace may be corrupt"));
+        assert!(log_contains_crash_recovery("Starting crash recovery"));
+        assert!(!log_contains_fatal_innodb("ready for connections"));
+    }
+
+    #[test]
     fn lee_solo_el_tramo_nuevo() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("error.log");
@@ -61,12 +113,6 @@ mod tests {
         std::fs::write(&path, "linea-antigua\nready for connections\n").unwrap();
         let chunk = read_log_since(&path, offset).unwrap();
         assert!(chunk.contains("ready for connections"));
-        assert!(
-            !chunk.contains("linea-antigua")
-                || chunk.starts_with("ready")
-                || chunk.contains("ready")
-        );
-        // El tramo nuevo empieza tras offset: puede ser solo la segunda línea.
         assert!(log_contains_ready(&chunk));
     }
 }

@@ -318,6 +318,40 @@ fn session(
                 reply_error(&mut stream, id, -32033, &message, &cause, &action)?;
             }
         },
+        "db.quarantine" => match handle_db_quarantine(db, log) {
+            Ok(manifest) => {
+                write_frame(&mut stream, &protocol_success(id, json!(manifest)))?;
+            }
+            Err((message, cause, action)) => {
+                reply_error(&mut stream, id, -32034, &message, &cause, &action)?;
+            }
+        },
+        "db.quarantine.list" => match db.quarantine_list() {
+            Ok(timestamps) => {
+                write_frame(
+                    &mut stream,
+                    &protocol_success(id, json!({ "timestamps": timestamps })),
+                )?;
+            }
+            Err(error) => {
+                reply_error(
+                    &mut stream,
+                    id,
+                    -32035,
+                    &error.message,
+                    &error.cause,
+                    &error.action,
+                )?;
+            }
+        },
+        "db.quarantine.restore" => match handle_db_quarantine_restore(db, &request, log) {
+            Ok(manifest) => {
+                write_frame(&mut stream, &protocol_success(id, json!(manifest)))?;
+            }
+            Err((message, cause, action)) => {
+                reply_error(&mut stream, id, -32036, &message, &cause, &action)?;
+            }
+        },
         other => {
             reply_error(
                 &mut stream,
@@ -514,6 +548,50 @@ fn handle_db_job(
     }
     db.job(job_id)
         .map_err(|error| (error.message, error.cause, error.action))
+}
+
+fn handle_db_quarantine(
+    db: &DbService,
+    log: &Logger,
+) -> Result<hostig_processes::mariadb::QuarantineManifest, (String, String, String)> {
+    match db.quarantine() {
+        Ok(manifest) => {
+            log.info("processes", &format!("cuarentena {}", manifest.timestamp));
+            Ok(manifest)
+        }
+        Err(error) => {
+            log.error("processes", &error.message, &error.cause, &error.action);
+            Err((error.message, error.cause, error.action))
+        }
+    }
+}
+
+fn handle_db_quarantine_restore(
+    db: &DbService,
+    request: &Value,
+    log: &Logger,
+) -> Result<hostig_processes::mariadb::QuarantineManifest, (String, String, String)> {
+    let timestamp = request
+        .pointer("/params/timestamp")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if timestamp.is_empty() {
+        return Err((
+            "parámetros incompletos".into(),
+            "falta timestamp".into(),
+            "usa hostig db quarantine restore <timestamp>".into(),
+        ));
+    }
+    match db.quarantine_restore(timestamp) {
+        Ok(manifest) => {
+            log.info("processes", &format!("restaurada cuarentena {timestamp}"));
+            Ok(manifest)
+        }
+        Err(error) => {
+            log.error("processes", &error.message, &error.cause, &error.action);
+            Err((error.message, error.cause, error.action))
+        }
+    }
 }
 
 fn handle_db_kill(

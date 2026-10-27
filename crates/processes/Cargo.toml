@@ -6,12 +6,17 @@ publish.workspace = true
 license.workspace = true
 description = "Supervisión de procesos de servidor y instancia MariaDB (ADR 0003)."
 
+[[bin]]
+name = "fake-mariadbd"
+path = "src/bin/fake-mariadbd.rs"
+
 [dependencies]
 hostig-ipc = { path = "../ipc" }
 hostig-ports = { path = "../ports" }
 hostig-runtimes = { path = "../runtimes" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]

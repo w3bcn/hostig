@@ -63,6 +63,101 @@ pub fn write_my_ini(paths: &InstancePaths, basedir: &Path, port: u16) -> Result<
     Ok(())
 }
 
+/// Resultado de regenerar my.ini desde la plantilla (ADR 0005 / 0012).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigRegen {
+    pub changed: bool,
+    pub diff_summary: String,
+    pub dangerous_directives: Vec<String>,
+}
+
+/// Regenera my.ini. Si el disco difería, resume el cambio y avisa de
+/// `skip-grant-tables` / `skip-networking` en la versión anterior.
+pub fn regenerate_my_ini(paths: &InstancePaths, basedir: &Path, port: u16) -> Result<ConfigRegen> {
+    paths.ensure_dirs()?;
+    let next = generate_my_ini(paths, basedir, port)?;
+    let previous = if paths.my_ini.is_file() {
+        fs::read_to_string(&paths.my_ini).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let mut dangerous = Vec::new();
+    let prev_lower = previous.to_ascii_lowercase();
+    if prev_lower.contains("skip-grant-tables") {
+        dangerous.push("skip-grant-tables".into());
+    }
+    if prev_lower.contains("skip-networking") {
+        dangerous.push("skip-networking".into());
+    }
+    let changed = normalize_ini(&previous) != normalize_ini(&next);
+    let diff_summary = if !changed {
+        String::new()
+    } else if previous.is_empty() {
+        "my.ini creado desde la plantilla".into()
+    } else {
+        summarize_ini_diff(&previous, &next)
+    };
+    fs::write(&paths.my_ini, next.as_bytes())?;
+    Ok(ConfigRegen {
+        changed,
+        diff_summary,
+        dangerous_directives: dangerous,
+    })
+}
+
+fn normalize_ini(text: &str) -> String {
+    text.replace("\r\n", "\n").trim().to_string()
+}
+
+fn summarize_ini_diff(old: &str, new: &str) -> String {
+    let old_keys: std::collections::BTreeSet<_> = ini_keys(old).into_iter().collect();
+    let new_keys: std::collections::BTreeSet<_> = ini_keys(new).into_iter().collect();
+    let mut parts = Vec::new();
+    for k in old_keys.difference(&new_keys) {
+        parts.push(format!("quitada {k}"));
+    }
+    for k in new_keys.difference(&old_keys) {
+        parts.push(format!("añadida {k}"));
+    }
+    for k in old_keys.intersection(&new_keys) {
+        let ov = ini_value(old, k);
+        let nv = ini_value(new, k);
+        if ov != nv {
+            parts.push(format!("cambiada {k}: {ov:?} → {nv:?}"));
+        }
+    }
+    if parts.is_empty() {
+        "contenido distinto (sin claves parseables)".into()
+    } else {
+        parts.join("; ")
+    }
+}
+
+fn ini_keys(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
+                return None;
+            }
+            line.split_once('=')
+                .map(|(k, _)| k.trim().to_ascii_lowercase())
+        })
+        .collect()
+}
+
+fn ini_value(text: &str, key: &str) -> String {
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim().eq_ignore_ascii_case(key) {
+                return v.trim().to_string();
+            }
+        }
+    }
+    String::new()
+}
+
 fn path_ini(path: &Path) -> String {
     // my.ini en Windows acepta barras normales; escapamos \.
     path.display().to_string().replace('\\', "/")

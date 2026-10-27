@@ -91,6 +91,19 @@ enum DbCommand {
         /// PID que debe coincidir con el registro del supervisor.
         pid: u32,
     },
+    /// Cuarentena de archivos anómalos del datadir (ADR 0012).
+    Quarantine {
+        #[command(subcommand)]
+        action: Option<QuarantineCommand>,
+    },
+}
+
+#[derive(Subcommand)]
+enum QuarantineCommand {
+    /// Lista timestamps de cuarentenas.
+    List,
+    /// Restaura una cuarentena por timestamp.
+    Restore { timestamp: String },
 }
 
 fn main() {
@@ -115,6 +128,11 @@ fn main() {
             DbCommand::Stop => db_stop(),
             DbCommand::Status => db_status(),
             DbCommand::Kill { pid } => db_kill(pid),
+            DbCommand::Quarantine { action } => match action {
+                None => db_quarantine(),
+                Some(QuarantineCommand::List) => db_quarantine_list(),
+                Some(QuarantineCommand::Restore { timestamp }) => db_quarantine_restore(&timestamp),
+            },
         },
     };
     std::process::exit(code);
@@ -481,6 +499,52 @@ fn db_kill(pid: u32) -> i32 {
         Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),
     };
     match Client::call(&layout, "db.kill", json!({ "pid": pid })) {
+        Ok(result) => {
+            println!("{result}");
+            0
+        }
+        Err(error) => fail_client(error),
+    }
+}
+
+fn db_quarantine() -> i32 {
+    let layout = match Layout::from_env() {
+        Ok(layout) => layout,
+        Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),
+    };
+    match Client::call(&layout, "db.quarantine", json!({})) {
+        Ok(result) => {
+            println!("{result}");
+            0
+        }
+        Err(error) => fail_client(error),
+    }
+}
+
+fn db_quarantine_list() -> i32 {
+    let layout = match Layout::from_env() {
+        Ok(layout) => layout,
+        Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),
+    };
+    match Client::call(&layout, "db.quarantine.list", json!({})) {
+        Ok(result) => {
+            println!("{result}");
+            0
+        }
+        Err(error) => fail_client(error),
+    }
+}
+
+fn db_quarantine_restore(timestamp: &str) -> i32 {
+    let layout = match Layout::from_env() {
+        Ok(layout) => layout,
+        Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),
+    };
+    match Client::call(
+        &layout,
+        "db.quarantine.restore",
+        json!({ "timestamp": timestamp }),
+    ) {
         Ok(result) => {
             println!("{result}");
             0
