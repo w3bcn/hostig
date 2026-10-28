@@ -103,7 +103,10 @@ pub fn regenerate_apache_config(
     let router_fcgi = path_fcgi_target(&paths.router_php);
     let members = php_ports
         .iter()
-        .map(|p| format!("    BalancerMember fcgi://127.0.0.1:{p}/{router_fcgi} retry=1"))
+        .map(|p| {
+            // disablereuse: evita reutilizar un socket FastCGI tras el reciclado de php-cgi.
+            format!("    BalancerMember fcgi://127.0.0.1:{p}/{router_fcgi} retry=1 disablereuse=On")
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let conf = HTTPD_TEMPLATE
@@ -194,6 +197,7 @@ mod tests {
         assert!(
             conf.contains("BalancerMember fcgi://127.0.0.1:9000/")
                 && conf.contains("retry=1")
+                && conf.contains("disablereuse=On")
                 && conf.contains("fcgi-router.php"),
             "{conf}"
         );

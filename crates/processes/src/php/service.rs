@@ -2,6 +2,7 @@
 
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -99,8 +100,16 @@ impl Default for PhpStartRequest {
 struct Worker {
     id: String,
     port: u16,
-    child: Option<std::process::Child>,
+    /// Tras el spawn el `Child` vive en el hilo waiter; aquí solo el PID.
     pid: Option<u32>,
+}
+
+struct WorkerExit {
+    id: String,
+    port: u16,
+    index: usize,
+    /// `Some(code)` tras `Child::wait`; `None` interior si el SO no dio código.
+    code: Option<Option<i32>>,
 }
 
 struct Inner {
@@ -119,6 +128,9 @@ pub struct PhpService {
     catalog: Catalog,
     settings: Mutex<PhpSettings>,
     inner: Mutex<Inner>,
+    /// Salidas de workers (reciclado o caída), detectadas al instante con `Child::wait`.
+    exit_tx: Sender<WorkerExit>,
+    exit_rx: Mutex<Receiver<WorkerExit>>,
 }
 
 impl PhpService {
@@ -132,6 +144,7 @@ impl PhpService {
             )
         })?;
         let settings = load_php_settings(&data_dir)?;
+        let (exit_tx, exit_rx) = mpsc::channel();
         Ok(Self {
             data_dir,
             catalog,
@@ -152,6 +165,8 @@ impl PhpService {
                 watchdog_started: false,
                 ports: vec![],
             }),
+            exit_tx,
+            exit_rx: Mutex::new(exit_rx),
         })
     }
 
@@ -371,8 +386,12 @@ impl PhpService {
             preferred = port.saturating_add(1);
         }
 
+        // Desfase de cupo por miembro para que no reciclén a la vez (ADR 0005: el
+        // balancer sigue sirviendo con los demás mientras uno se sustituye).
+        let stagger = (max_requests / pool_size.max(1)).max(5);
         let mut workers = Vec::new();
         for (index, port) in ports.iter().copied().enumerate() {
+            let worker_max = max_requests.saturating_add(index as u32 * stagger);
             match self.spawn_worker(
                 &request.id,
                 index,
@@ -380,7 +399,7 @@ impl PhpService {
                 &php_cgi,
                 &php_root,
                 &paths,
-                max_requests,
+                worker_max,
                 &request.version,
             ) {
                 Ok(worker) => workers.push(worker),
@@ -440,10 +459,26 @@ impl PhpService {
         let spawned = spawn_server(&spec)?;
         let pid = spawned.record.pid;
         spawned.record.save(&self.data_dir)?;
+        let mut child = spawned.child;
+        let exit_tx = self.exit_tx.clone();
+        let wait_id = member_id.clone();
+        let wait_port = port;
+        let wait_index = index;
+        thread::spawn(move || {
+            let code = match child.wait() {
+                Ok(status) => Some(status.code()),
+                Err(_) => Some(None),
+            };
+            let _ = exit_tx.send(WorkerExit {
+                id: wait_id,
+                port: wait_port,
+                index: wait_index,
+                code,
+            });
+        });
         Ok(Worker {
             id: member_id,
             port,
-            child: Some(spawned.child),
             pid: Some(pid),
         })
     }
@@ -484,8 +519,8 @@ impl PhpService {
     }
 
     fn watchdog_loop(self: &Arc<Self>) {
+        let poll = Duration::from_millis(50);
         loop {
-            thread::sleep(self.settings().health_interval());
             {
                 let inner = self.inner.lock().expect("php inner");
                 if inner.stop_requested || !matches!(inner.status.state, PhpState::Running) {
@@ -495,53 +530,46 @@ impl PhpService {
                     return;
                 }
             }
-            let deaths = self.collect_worker_exits();
-            for death in deaths {
-                if self.inner.lock().expect("php inner").stop_requested {
-                    return;
-                }
-                if let Err(error) = self.handle_worker_exit(death) {
-                    let mut inner = self.inner.lock().expect("php inner");
-                    inner.status.state = PhpState::Failed;
-                    inner.status.error = Some(error.cause);
-                    inner.watchdog_started = false;
-                    return;
-                }
-            }
-        }
-    }
-
-    fn collect_worker_exits(&self) -> Vec<WorkerExit> {
-        let mut inner = self.inner.lock().expect("php inner");
-        let mut out = Vec::new();
-        for worker in &mut inner.workers {
-            let code = if let Some(child) = worker.child.as_mut() {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        let code = status.code();
-                        worker.child = None;
-                        Some(code)
+            let death = {
+                let rx = self.exit_rx.lock().expect("php exit_rx");
+                match rx.recv_timeout(poll) {
+                    Ok(death) => Some(death),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        let mut inner = self.inner.lock().expect("php inner");
+                        inner.watchdog_started = false;
+                        return;
                     }
-                    Ok(None) => continue,
-                    Err(_) => Some(None),
                 }
-            } else if let Some(pid) = worker.pid {
-                if hostig_ipc::process_is_running(pid) {
-                    continue;
-                }
-                Some(None)
-            } else {
+            };
+            let Some(death) = death else {
                 continue;
             };
-            out.push(WorkerExit {
-                id: worker.id.clone(),
-                port: worker.port,
-                index: worker_index(&worker.id),
-                code,
-            });
-            worker.pid = None;
+            if self.inner.lock().expect("php inner").stop_requested {
+                return;
+            }
+            // Descarta salidas de un stop ordenado (PID ya limpiado).
+            {
+                let mut inner = self.inner.lock().expect("php inner");
+                let still = inner
+                    .workers
+                    .iter()
+                    .any(|w| w.id == death.id && w.pid.is_some());
+                if !still {
+                    continue;
+                }
+                if let Some(slot) = inner.workers.iter_mut().find(|w| w.id == death.id) {
+                    slot.pid = None;
+                }
+            }
+            if let Err(error) = self.handle_worker_exit(death) {
+                let mut inner = self.inner.lock().expect("php inner");
+                inner.status.state = PhpState::Failed;
+                inner.status.error = Some(error.cause);
+                inner.watchdog_started = false;
+                return;
+            }
         }
-        out
     }
 
     fn handle_worker_exit(self: &Arc<Self>, death: WorkerExit) -> Result<()> {
@@ -578,12 +606,20 @@ impl PhpService {
         }
 
         let settings = self.settings();
-        let (pool_id, version) = {
+        let (pool_id, version, pool_len) = {
             let inner = self.inner.lock().expect("php inner");
-            (inner.status.id.clone(), inner.status.version.clone())
+            (
+                inner.status.id.clone(),
+                inner.status.version.clone(),
+                inner.workers.len().max(1) as u32,
+            )
         };
         let (php_cgi, php_root) = resolve_php_cgi(&self.data_dir, &self.catalog, &version)?;
         let paths = PhpPaths::new(&self.data_dir, &pool_id);
+        let stagger = (settings.fcgi_max_requests / pool_len).max(5);
+        let worker_max = settings
+            .fcgi_max_requests
+            .saturating_add(death.index as u32 * stagger);
         let worker = self.spawn_worker(
             &pool_id,
             death.index,
@@ -591,7 +627,7 @@ impl PhpService {
             &php_cgi,
             &php_root,
             &paths,
-            settings.fcgi_max_requests,
+            worker_max,
             &version,
         )?;
         let deadline = Instant::now() + settings.start_total();
@@ -607,14 +643,6 @@ impl PhpService {
     }
 }
 
-struct WorkerExit {
-    id: String,
-    port: u16,
-    index: usize,
-    /// `Some(code)` tras try_wait; `None` interior si el SO no dio código.
-    code: Option<Option<i32>>,
-}
-
 fn refresh_worker_status(inner: &mut Inner) {
     inner.status.workers = inner
         .workers
@@ -628,21 +656,10 @@ fn refresh_worker_status(inner: &mut Inner) {
     inner.status.crash_restarts = inner.restart_times.len() as u32;
 }
 
-fn worker_index(id: &str) -> usize {
-    id.rsplit('-')
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
-}
-
 fn stop_child(worker: &mut Worker) -> Result<()> {
-    if let Some(mut child) = worker.child.take() {
-        let _ = child.kill();
-        let _ = child.wait();
-    } else if let Some(pid) = worker.pid {
+    if let Some(pid) = worker.pid.take() {
         let _ = crate::os::terminate_process(pid);
     }
-    worker.pid = None;
     Ok(())
 }
 
