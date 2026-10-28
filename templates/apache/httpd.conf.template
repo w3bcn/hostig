@@ -1,0 +1,77 @@
+# Generado por Hostig. No editar a mano: se regenera (ADR 0005).
+
+Define SRVROOT "{{SERVER_ROOT}}"
+ServerRoot "${SRVROOT}"
+Listen 127.0.0.1:{{HTTP_PORT}}
+ServerName 127.0.0.1:{{HTTP_PORT}}
+ServerAdmin hostig@localhost
+PidFile "{{PID_FILE}}"
+
+LoadModule authz_core_module modules/mod_authz_core.so
+LoadModule alias_module modules/mod_alias.so
+LoadModule dir_module modules/mod_dir.so
+LoadModule headers_module modules/mod_headers.so
+LoadModule log_config_module modules/mod_log_config.so
+LoadModule mime_module modules/mod_mime.so
+LoadModule proxy_module modules/mod_proxy.so
+LoadModule proxy_fcgi_module modules/mod_proxy_fcgi.so
+LoadModule proxy_balancer_module modules/mod_proxy_balancer.so
+LoadModule slotmem_shm_module modules/mod_slotmem_shm.so
+LoadModule lbmethod_byrequests_module modules/mod_lbmethod_byrequests.so
+LoadModule rewrite_module modules/mod_rewrite.so
+LoadModule setenvif_module modules/mod_setenvif.so
+
+TypesConfig conf/mime.types
+AddType application/x-httpd-php .php
+
+LogFormat "%h %l %u %t \"%r\" %>s %b" common
+ErrorLog "{{ERROR_LOG}}"
+LogLevel warn
+CustomLog "{{ACCESS_LOG}}" common
+
+ProxyRequests Off
+ProxyPreserveHost On
+
+<Directory />
+    AllowOverride none
+    Require all denied
+</Directory>
+
+DocumentRoot "{{DOCUMENT_ROOT}}"
+<Directory "{{DOCUMENT_ROOT}}">
+    Options Indexes FollowSymLinks
+    AllowOverride All
+    Require all granted
+    DirectoryIndex index.php index.html
+</Directory>
+
+# Router y health fuera del DocumentRoot del usuario (ADR 0003 / 0005).
+<Directory "{{HOSTIG_DIR}}">
+    Options None
+    AllowOverride None
+    Require all granted
+</Directory>
+
+# Pool: cada miembro es php-cgi -b; la ruta C|... apunta al router FastCGI.
+# ProxyFCGISetEnvIf fija SCRIPT_FILENAME (en Windows php-cgi rechaza "/C:/...").
+<Proxy "balancer://php">
+{{BALANCER_MEMBERS}}
+    ProxySet lbmethod=byrequests
+</Proxy>
+
+ProxyFCGISetEnvIf "true" SCRIPT_FILENAME "{{ROUTER_PHP}}"
+ProxyPassMatch "^/(.*\.php(/.*)?)$" "balancer://php/"
+ProxyPassMatch "^/__hostig/health$" "balancer://php/"
+
+<VirtualHost 127.0.0.1:{{HTTP_PORT}}>
+    DocumentRoot "{{DOCUMENT_ROOT}}"
+    <Directory "{{DOCUMENT_ROOT}}">
+        Options Indexes FollowSymLinks
+        AllowOverride All
+        Require all granted
+        DirectoryIndex index.php index.html
+    </Directory>
+    ProxyFCGISetEnvIf "true" SCRIPT_FILENAME "{{ROUTER_PHP}}"
+    ProxyPassMatch "^/(.*\.php(/.*)?)$" "balancer://php/"
+    ProxyPassMatch "^/__hostig/health$" "balancer://php/"
+</VirtualHost>

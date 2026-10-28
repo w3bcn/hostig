@@ -497,6 +497,7 @@ impl DbService {
             current_dir: Some(basedir),
             port: request.port,
             version: request.version.clone(),
+            env: vec![],
         };
         let spawned = spawn_server(&spec)?;
         let pid = spawned.record.pid;

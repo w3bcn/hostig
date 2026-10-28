@@ -13,9 +13,9 @@ urls = [
   "https://www.apachelounge.com/download/VS18/binaries/httpd-2.4.69-261002-win64-VS18.zip",
 ]
 filename = "httpd-2.4.69-261002-win64-VS18.zip"
-sha256 = "ca272e0b75abad78b1e4029a0753b20ff2232d2d857e8eebeea5d469c5776977"
+sha256 = "77d715d0d9cee731e2251e7ddc2090a7a8e6d41fedef2e9827cd918593c5a652"
 license = "Apache-2.0"
-notes = "ZIP Win64 de Apache Lounge (VS18 / Visual Studio C++ 2026), no binario de la ASF. Exige el redistribuible VC++ 14.51+ (etiqueta Visual Studio 2017-2026). El ZIP no incluye esas DLL: el ADR 0002 manda llevarlas en la carpeta del runtime junto a httpd.exe (copia local desde el redistribuible, sin ejecutar vc_redist)."
+notes = "ZIP Win64 de Apache Lounge (VS18 / Visual Studio C++ 2026), no binario de la ASF. Exige el redistribuible VC++ 14.51+ (etiqueta Visual Studio 2017-2026). El ZIP no incluye esas DLL: el ADR 0002 manda llevarlas en la carpeta del runtime junto a httpd.exe (copia local desde el redistribuible, sin ejecutar vc_redist). SHA-256 recalculado 2026-10-28 sobre la URL del catálogo (el publicador regeneró el ZIP)."
 
 [[runtime]]
 component = "php"

@@ -25,7 +25,7 @@ fn la_cli_obtiene_el_status_de_un_supervisor_recien_lanzado() {
         data: data.path().to_path_buf(),
     };
     let started = run(data.path(), ["supervisor", "start"]);
-    let status = run(data.path(), ["status"]);
+    let status = run(data.path(), ["supervisor", "status"]);
     assert_eq!(started["running"], true);
     assert_eq!(status["running"], true);
     assert_eq!(started["pid"], status["pid"]);
@@ -51,7 +51,7 @@ fn un_segundo_arranque_no_crea_otro_proceso() {
         .unwrap();
     let exit = child.wait().unwrap();
     assert_eq!(exit.code(), Some(0));
-    let still = run(data.path(), ["status"]);
+    let still = run(data.path(), ["supervisor", "status"]);
     assert_eq!(still["pid"], first["pid"]);
 }
 

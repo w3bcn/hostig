@@ -1,0 +1,26 @@
+<?php
+// Generado por Hostig. Fuera del DocumentRoot del usuario (ADR 0003 / 0005).
+header('Content-Type: text/plain; charset=utf-8');
+header('Cache-Control: no-store');
+
+$host = '{{DB_HOST}}';
+$port = {{DB_PORT}};
+$user = '{{DB_USER}}';
+$pass = '{{DB_PASSWORD}}';
+
+mysqli_report(MYSQLI_REPORT_OFF);
+$mysqli = @mysqli_init();
+if ($mysqli === false) {
+    http_response_code(503);
+    echo "php-mysqli-init-failed\n";
+    exit;
+}
+$ok = @mysqli_real_connect($mysqli, $host, $user, $pass, '', $port);
+if (!$ok) {
+    http_response_code(503);
+    echo "mariadb-unreachable\n";
+    exit;
+}
+mysqli_close($mysqli);
+http_response_code(200);
+echo "ok\n";

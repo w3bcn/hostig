@@ -9,8 +9,8 @@ mod service;
 mod settings;
 
 pub use config::{
-    generate_my_ini, regenerate_my_ini, ConfigRegen, InstancePaths, DEFAULT_INSTANCE_ID,
-    DEFAULT_PORT,
+    generate_my_ini, read_password, regenerate_my_ini, ConfigRegen, InstancePaths,
+    DEFAULT_INSTANCE_ID, DEFAULT_PORT,
 };
 pub use init::ensure_initialized;
 pub use logparse::{
