@@ -8,6 +8,7 @@ use crate::error::{ProcessError, Result};
 /// NTSTATUS: STATUS_DLL_NOT_FOUND.
 pub const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
 /// Win32: ERROR_MOD_NOT_FOUND.
+#[cfg(windows)]
 pub const ERROR_MOD_NOT_FOUND: i32 = 126;
 
 /// Ejecuta `{exe} -v` y traduce fallos por DLL ausente a un error de Hostig.
@@ -27,18 +28,21 @@ pub fn verify_binary_starts(exe: &Path, component: &str) -> Result<()> {
     command.stderr(Stdio::null());
     // PATH mínimo: carpeta del exe (DLL locales) + System32.
     if let Some(dir) = exe.parent() {
-        let mut path = dir.display().to_string();
         #[cfg(windows)]
         {
             let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-            path = format!("{path};{system_root}\\System32;{system_root}");
+            let path = format!("{};{system_root}\\System32;{system_root}", dir.display());
             command.env("SystemRoot", &system_root);
             command.env(
                 "WINDIR",
                 std::env::var("WINDIR").unwrap_or_else(|_| system_root.clone()),
             );
+            command.env("PATH", path);
         }
-        command.env("PATH", path);
+        #[cfg(not(windows))]
+        {
+            command.env("PATH", dir.display().to_string());
+        }
     }
     match command.status() {
         Ok(status) if status.success() => Ok(()),

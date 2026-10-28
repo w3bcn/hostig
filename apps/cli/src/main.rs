@@ -62,6 +62,8 @@ enum SupervisorCommand {
     Start,
     /// Pide el apagado y espera a que el proceso termine.
     Stop,
+    /// Estado del proceso hostig-supervisor (pid / running).
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -137,6 +139,7 @@ fn main() {
         Commands::Supervisor { action } => match action {
             SupervisorCommand::Start => supervisor_start(),
             SupervisorCommand::Stop => supervisor_stop(),
+            SupervisorCommand::Status => supervisor_status(),
         },
         Commands::Runtimes { action } => match action {
             RuntimesCommand::List => runtimes_list(),
@@ -351,6 +354,27 @@ fn supervisor_start() -> i32 {
             );
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn supervisor_status() -> i32 {
+    let layout = match Layout::from_env() {
+        Ok(layout) => layout,
+        Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),
+    };
+    match Client::status(&layout) {
+        Ok(state) => {
+            println!(
+                "{}",
+                json!({
+                    "running": state.running,
+                    "pid": state.pid,
+                    "protocol": state.protocol,
+                })
+            );
+            0
+        }
+        Err(error) => fail_client(error),
     }
 }
 

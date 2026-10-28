@@ -101,7 +101,7 @@ fn json_stdout(stdout: &str) -> Value {
 fn wait_supervisor(data: &Path, budget: Duration) {
     let deadline = Instant::now() + budget;
     while Instant::now() < deadline {
-        let (code, _, _) = run_hostig(data, &["status"]);
+        let (code, _, _) = run_hostig(data, &["supervisor", "status"]);
         if code == 0 {
             return;
         }
