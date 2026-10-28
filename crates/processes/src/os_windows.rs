@@ -2,6 +2,9 @@ use std::path::PathBuf;
 
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::System::Console::{
+    AttachConsole, FreeConsole, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler, CTRL_BREAK_EVENT,
+};
 use windows::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
@@ -63,6 +66,31 @@ pub fn terminate_process(pid: u32) -> Result<()> {
                 "TerminateProcess falló",
                 error.to_string(),
                 "revisa permisos; esto es solo el camino de emergencia",
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Envía `CTRL_BREAK_EVENT` al grupo de proceso (PID del líder con
+/// `CREATE_NEW_PROCESS_GROUP`). Usado para apagar httpd de consola (ADR 0003).
+pub fn send_ctrl_break(process_group_pid: u32) -> Result<()> {
+    unsafe {
+        // Adjuntar a la consola del objetivo (si la tiene) o al grupo.
+        let _ = FreeConsole();
+        if AttachConsole(process_group_pid).is_err() {
+            // Sin consola compartida: GenerateConsoleCtrlEvent al pgid sigue
+            // siendo la vía documentada para procesos CREATE_NEW_PROCESS_GROUP.
+        }
+        let _ = SetConsoleCtrlHandler(None, true);
+        let result = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process_group_pid);
+        let _ = SetConsoleCtrlHandler(None, false);
+        let _ = FreeConsole();
+        result.map_err(|error| {
+            ProcessError::new(
+                "no se pudo enviar ctrl-break",
+                format!("pid/grupo {process_group_pid}: {error}"),
+                "reintenta hostig stop; no se usa taskkill por nombre",
             )
         })?;
     }

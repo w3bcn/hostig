@@ -17,6 +17,8 @@ pub struct SpawnSpec {
     pub current_dir: Option<PathBuf>,
     pub port: u16,
     pub version: String,
+    /// Variables de entorno adicionales (tras `env_clear` y el PATH controlado).
+    pub env: Vec<(String, String)>,
 }
 
 /// Proceso vivo con metadatos para el registro.
@@ -44,6 +46,9 @@ pub fn spawn_server(spec: &SpawnSpec) -> Result<SpawnedProcess> {
     command.stderr(Stdio::null());
     command.env_clear();
     apply_controlled_env(&mut command, &spec.path_dirs);
+    for (key, value) in &spec.env {
+        command.env(key, value);
+    }
     if let Some(dir) = &spec.current_dir {
         command.current_dir(dir);
     }

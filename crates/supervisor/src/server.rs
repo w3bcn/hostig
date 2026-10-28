@@ -8,7 +8,10 @@ use hostig_ipc::{
     tokens_match, write_frame, ByteStream, FrameError, Layout, Listener, MAX_FRAME_LEN,
     PROTOCOL_VERSION,
 };
+use hostig_processes::apache::ApacheService;
 use hostig_processes::mariadb::{DbService, StartRequest, DEFAULT_MARIADB_VERSION};
+use hostig_processes::php::PhpService;
+use hostig_processes::{StackService, StackStartRequest};
 use hostig_runtimes::{clean_tmp_runtimes, RuntimeService};
 use serde_json::{json, Value};
 
@@ -23,6 +26,7 @@ const MAX_SESSIONS: usize = 32;
 struct Services {
     runtimes: Arc<RuntimeService>,
     db: Arc<DbService>,
+    stack: Arc<StackService>,
 }
 
 pub fn serve(layout: &Layout, log: &Logger, _lock: Lock) -> std::io::Result<()> {
@@ -63,6 +67,32 @@ pub fn serve(layout: &Layout, log: &Logger, _lock: Lock) -> std::io::Result<()> 
             ));
         }
     };
+    let php = match PhpService::with_embedded(&layout.data_dir) {
+        Ok(service) => Arc::new(service),
+        Err(error) => {
+            log.error("processes", &error.message, &error.cause, &error.action);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error.to_string(),
+            ));
+        }
+    };
+    let apache = match ApacheService::with_embedded(&layout.data_dir) {
+        Ok(service) => Arc::new(service),
+        Err(error) => {
+            log.error("processes", &error.message, &error.cause, &error.action);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error.to_string(),
+            ));
+        }
+    };
+    let stack = Arc::new(StackService::new(
+        layout.data_dir.clone(),
+        Arc::clone(&db),
+        php,
+        apache,
+    ));
     let listener = listen(layout)?;
     log.info(
         "supervisor",
@@ -70,7 +100,11 @@ pub fn serve(layout: &Layout, log: &Logger, _lock: Lock) -> std::io::Result<()> 
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let active = Arc::new(AtomicUsize::new(0));
-    let services = Services { runtimes, db };
+    let services = Services {
+        runtimes,
+        db,
+        stack,
+    };
     let result = accept_loop(
         &listener, layout, &token, log, &shutdown, &active, &services,
     );
@@ -127,10 +161,11 @@ fn accept_loop(
         let active = Arc::clone(active);
         let runtimes = Arc::clone(&services.runtimes);
         let db = Arc::clone(&services.db);
+        let stack = Arc::clone(&services.stack);
         let wake_layout = layout.clone();
         active.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
-            let outcome = session(stream, &token, &log, &shutdown, &runtimes, &db);
+            let outcome = session(stream, &token, &log, &shutdown, &runtimes, &db, &stack);
             if shutdown.load(Ordering::SeqCst) {
                 wake_accept(&wake_layout);
             }
@@ -168,6 +203,7 @@ fn session(
     shutdown: &AtomicBool,
     runtimes: &RuntimeService,
     db: &Arc<DbService>,
+    stack: &Arc<StackService>,
 ) -> std::io::Result<()> {
     let first = match read_frame_timed(&mut stream, log, "el cliente no envió su mensaje a tiempo")
     {
@@ -352,6 +388,34 @@ fn session(
                 reply_error(&mut stream, id, -32036, &message, &cause, &action)?;
             }
         },
+        "stack.start" => match handle_stack_start(stack, &request, log) {
+            Ok(status) => {
+                write_frame(&mut stream, &protocol_success(id, json!(status)))?;
+            }
+            Err((message, cause, action)) => {
+                reply_error(&mut stream, id, -32040, &message, &cause, &action)?;
+            }
+        },
+        "stack.stop" => match handle_stack_stop(stack, log) {
+            Ok(status) => {
+                write_frame(&mut stream, &protocol_success(id, json!(status)))?;
+            }
+            Err((message, cause, action)) => {
+                reply_error(&mut stream, id, -32041, &message, &cause, &action)?;
+            }
+        },
+        "stack.status" => {
+            let status = stack.status();
+            write_frame(&mut stream, &protocol_success(id, json!(status)))?;
+        }
+        "stack.job" => match handle_stack_job(stack, &request) {
+            Ok(status) => {
+                write_frame(&mut stream, &protocol_success(id, json!(status)))?;
+            }
+            Err((message, cause, action)) => {
+                reply_error(&mut stream, id, -32042, &message, &cause, &action)?;
+            }
+        },
         other => {
             reply_error(
                 &mut stream,
@@ -359,7 +423,7 @@ fn session(
                 -32601,
                 "método desconocido",
                 &format!("el método {other} no existe"),
-                "usa status, shutdown, runtimes.*, ports.check o db.*",
+                "usa status, shutdown, runtimes.*, ports.check, db.* o stack.*",
             )?;
         }
     }
@@ -626,6 +690,98 @@ fn handle_db_kill(
             Err((error.message, error.cause, error.action))
         }
     }
+}
+
+fn handle_stack_start(
+    stack: &Arc<StackService>,
+    request: &Value,
+    log: &Logger,
+) -> Result<hostig_processes::StackJobStatus, (String, String, String)> {
+    let mut start = StackStartRequest::default();
+    if let Some(port) = request.pointer("/params/http_port").and_then(Value::as_u64) {
+        if port > u16::MAX as u64 {
+            return Err((
+                "puerto HTTP fuera de rango".into(),
+                format!("{port}"),
+                "usa 8080-8099".into(),
+            ));
+        }
+        start.http_port = Some(port as u16);
+    }
+    if let Some(port) = request.pointer("/params/db_port").and_then(Value::as_u64) {
+        if port > u16::MAX as u64 {
+            return Err((
+                "puerto MariaDB fuera de rango".into(),
+                format!("{port}"),
+                "usa 3306-3399".into(),
+            ));
+        }
+        start.db_port = Some(port as u16);
+    }
+    if let Some(v) = request
+        .pointer("/params/db_version")
+        .and_then(Value::as_str)
+    {
+        start.db_version = Some(v.to_string());
+    }
+    if let Some(n) = request
+        .pointer("/params/php_pool_size")
+        .and_then(Value::as_u64)
+    {
+        start.php_pool_size = Some(n as u32);
+    }
+    if let Some(n) = request
+        .pointer("/params/php_fcgi_max_requests")
+        .and_then(Value::as_u64)
+    {
+        start.php_fcgi_max_requests = Some(n as u32);
+    }
+    match stack.start_async(start) {
+        Ok(status) => {
+            log.info("processes", &format!("stack.start job {}", status.job_id));
+            Ok(status)
+        }
+        Err(error) => {
+            log.error("processes", &error.message, &error.cause, &error.action);
+            Err((error.message, error.cause, error.action))
+        }
+    }
+}
+
+fn handle_stack_stop(
+    stack: &Arc<StackService>,
+    log: &Logger,
+) -> Result<hostig_processes::StackJobStatus, (String, String, String)> {
+    match stack.stop_async() {
+        Ok(status) => {
+            log.info("processes", &format!("stack.stop job {}", status.job_id));
+            Ok(status)
+        }
+        Err(error) => {
+            log.error("processes", &error.message, &error.cause, &error.action);
+            Err((error.message, error.cause, error.action))
+        }
+    }
+}
+
+fn handle_stack_job(
+    stack: &StackService,
+    request: &Value,
+) -> Result<hostig_processes::StackJobStatus, (String, String, String)> {
+    let job_id = request
+        .pointer("/params/job_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if job_id.is_empty() {
+        return Err((
+            "parámetros incompletos".into(),
+            "falta job_id".into(),
+            "usa el id que devolvió stack.start o stack.stop".into(),
+        ));
+    }
+    stack
+        .job(job_id)
+        .map_err(|error| (error.message, error.cause, error.action))
 }
 
 fn handle_runtimes_verify(

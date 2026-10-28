@@ -31,6 +31,12 @@ jobs:
         with:
           path: ${{ runner.temp }}/hostig-mariadb-it-cache
           key: mariadb-it-${{ hashFiles('catalog/runtimes.toml') }}-11.4.13-winx64
+      - name: Cache stack runtimes (Windows IT PHP/Apache)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/hostig-stack-it-cache
+          key: stack-it-${{ hashFiles('catalog/runtimes.toml') }}-php-8.4.27-apache-2.4.69
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
@@ -38,6 +44,7 @@ jobs:
       - name: test
         env:
           HOSTIG_MARIADB_IT_CACHE: ${{ runner.temp }}/hostig-mariadb-it-cache
+          HOSTIG_STACK_IT_CACHE: ${{ runner.temp }}/hostig-stack-it-cache
           # Solo tests: permite MariaDB/supervisor si el job del runner niega breakaway (ADR 0011).
           HOSTIG_ALLOW_JOB_WITHOUT_BREAKAWAY: "1"
         run: cargo test --workspace

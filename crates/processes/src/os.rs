@@ -15,6 +15,12 @@ pub fn terminate_process(pid: u32) -> Result<()> {
     platform::terminate_process(pid)
 }
 
+/// Windows: ctrl-break al grupo de proceso. Unix: no-op (se usa señal en Apache).
+#[allow(dead_code)]
+pub fn send_ctrl_break(process_group_pid: u32) -> Result<()> {
+    platform::send_ctrl_break(process_group_pid)
+}
+
 #[cfg(windows)]
 #[path = "os_windows.rs"]
 mod platform;
@@ -40,6 +46,14 @@ mod platform {
             "plataforma no soportada",
             "terminate no disponible",
             "usa Windows, Linux o macOS",
+        ))
+    }
+
+    pub fn send_ctrl_break(_pid: u32) -> Result<()> {
+        Err(ProcessError::new(
+            "plataforma no soportada",
+            "ctrl-break no disponible",
+            "usa Windows",
         ))
     }
 }

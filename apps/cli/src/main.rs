@@ -15,7 +15,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Pregunta el estado al supervisor que ya está en marcha.
+    /// Arranca MariaDB, el pool PHP y Apache (y el supervisor si hace falta).
+    Start {
+        /// Puerto HTTP (defecto 8080; rango 8080-8099).
+        #[arg(long)]
+        http_port: Option<u16>,
+        /// Puerto MariaDB (defecto 3306).
+        #[arg(long)]
+        db_port: Option<u16>,
+        /// Tamaño del pool PHP (defecto 4).
+        #[arg(long)]
+        php_pool_size: Option<u32>,
+        /// PHP_FCGI_MAX_REQUESTS (defecto 500).
+        #[arg(long)]
+        php_fcgi_max_requests: Option<u32>,
+    },
+    /// Para Apache, PHP y MariaDB (apagado ordenado).
+    Stop,
+    /// Estado de MariaDB, PHP y Apache (puertos y PIDs).
     Status,
     /// Arranca o detiene el proceso hostig-supervisor.
     Supervisor {
@@ -109,10 +126,17 @@ enum QuarantineCommand {
 fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
-        Commands::Status => status(),
+        Commands::Start {
+            http_port,
+            db_port,
+            php_pool_size,
+            php_fcgi_max_requests,
+        } => stack_start(http_port, db_port, php_pool_size, php_fcgi_max_requests),
+        Commands::Stop => stack_stop(),
+        Commands::Status => stack_status(),
         Commands::Supervisor { action } => match action {
-            SupervisorCommand::Start => start(),
-            SupervisorCommand::Stop => stop(),
+            SupervisorCommand::Start => supervisor_start(),
+            SupervisorCommand::Stop => supervisor_stop(),
         },
         Commands::Runtimes { action } => match action {
             RuntimesCommand::List => runtimes_list(),
@@ -138,21 +162,133 @@ fn main() {
     std::process::exit(code);
 }
 
-fn status() -> i32 {
+fn ensure_supervisor_running() -> Result<Layout, i32> {
+    let layout = match Layout::from_env() {
+        Ok(layout) => layout,
+        Err(error) => return Err(fail(&error.to_string(), "revisa HOSTIG_DATA_DIR")),
+    };
+    if Client::status(&layout).is_ok() {
+        return Ok(layout);
+    }
+    let code = supervisor_start();
+    if code != 0 {
+        return Err(code);
+    }
+    Ok(layout)
+}
+
+fn stack_start(
+    http_port: Option<u16>,
+    db_port: Option<u16>,
+    php_pool_size: Option<u32>,
+    php_fcgi_max_requests: Option<u32>,
+) -> i32 {
+    let layout = match ensure_supervisor_running() {
+        Ok(layout) => layout,
+        Err(code) => return code,
+    };
+    let mut params = json!({});
+    if let Some(port) = http_port {
+        params["http_port"] = json!(port);
+    }
+    if let Some(port) = db_port {
+        params["db_port"] = json!(port);
+    }
+    if let Some(n) = php_pool_size {
+        params["php_pool_size"] = json!(n);
+    }
+    if let Some(n) = php_fcgi_max_requests {
+        params["php_fcgi_max_requests"] = json!(n);
+    }
+    let started = match Client::call(&layout, "stack.start", params) {
+        Ok(value) => value,
+        Err(error) => return fail_client(error),
+    };
+    poll_stack_job(&layout, &started, Duration::from_secs(60 * 10))
+}
+
+fn stack_stop() -> i32 {
     let layout = match Layout::from_env() {
         Ok(layout) => layout,
         Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),
     };
-    match Client::status(&layout) {
-        Ok(state) => {
-            print_state(&state_json(state.running, state.pid, state.protocol, None));
+    let started = match Client::call(&layout, "stack.stop", json!({})) {
+        Ok(value) => value,
+        Err(error) => return fail_client(error),
+    };
+    poll_stack_job(&layout, &started, Duration::from_secs(120))
+}
+
+fn stack_status() -> i32 {
+    let layout = match Layout::from_env() {
+        Ok(layout) => layout,
+        Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),
+    };
+    match Client::call(&layout, "stack.status", json!({})) {
+        Ok(value) => {
+            println!("{value}");
             0
         }
         Err(error) => fail_client(error),
     }
 }
 
-fn start() -> i32 {
+fn poll_stack_job(layout: &Layout, started: &Value, budget: Duration) -> i32 {
+    let job_id = started.get("job_id").and_then(Value::as_str).unwrap_or("");
+    if job_id.is_empty() {
+        println!("{started}");
+        return 1;
+    }
+    let state = started.get("state").and_then(Value::as_str).unwrap_or("");
+    if state == "succeeded" {
+        println!("{started}");
+        return 0;
+    }
+    if state == "failed" {
+        return fail_stack_job(started);
+    }
+    let deadline = Instant::now() + budget;
+    loop {
+        let status = match Client::call(layout, "stack.job", json!({ "job_id": job_id })) {
+            Ok(value) => value,
+            Err(error) => return fail_client(error),
+        };
+        let state = status.get("state").and_then(Value::as_str).unwrap_or("");
+        match state {
+            "succeeded" => {
+                println!("{status}");
+                return 0;
+            }
+            "failed" => return fail_stack_job(&status),
+            _ if Instant::now() > deadline => {
+                return fail(
+                    &format!("el trabajo {job_id} no terminó a tiempo"),
+                    "consulta el estado con hostig status",
+                );
+            }
+            _ => std::thread::sleep(Duration::from_millis(250)),
+        }
+    }
+}
+
+fn fail_stack_job(status: &Value) -> i32 {
+    let cause = status
+        .pointer("/error/cause")
+        .and_then(Value::as_str)
+        .unwrap_or("fallo desconocido");
+    let action = status
+        .pointer("/error/action")
+        .and_then(Value::as_str)
+        .unwrap_or("hostig status");
+    let message = status
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or("stack falló");
+    eprintln!("{message}");
+    fail(cause, action)
+}
+
+fn supervisor_start() -> i32 {
     let layout = match Layout::from_env() {
         Ok(layout) => layout,
         Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),
@@ -218,7 +354,7 @@ fn start() -> i32 {
     }
 }
 
-fn stop() -> i32 {
+fn supervisor_stop() -> i32 {
     let layout = match Layout::from_env() {
         Ok(layout) => layout,
         Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),

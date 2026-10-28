@@ -1,0 +1,39 @@
+<?php
+// Generado por Hostig. Punto de entrada FastCGI en Windows (ADR 0005).
+// Evita SCRIPT_FILENAME con "/C:/..." que php-cgi rechaza detrás de mod_proxy_fcgi.
+declare(strict_types=1);
+
+$docroot = '{{DOCUMENT_ROOT}}';
+$health = '{{HEALTH_PHP}}';
+
+$uri = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+if (!is_string($uri) || $uri === '') {
+    $uri = '/';
+}
+
+if ($uri === '/__hostig/health' || $uri === '/__hostig/health.php') {
+    require $health;
+    return;
+}
+
+$file = $docroot . $uri;
+if (is_dir($file)) {
+    $file = rtrim($file, '/\\') . DIRECTORY_SEPARATOR . 'index.php';
+}
+$file = str_replace(['/', '\\'], DIRECTORY_SEPARATOR, $file);
+$realDoc = realpath($docroot);
+$realFile = realpath($file);
+if ($realDoc === false || $realFile === false || !str_starts_with($realFile, $realDoc)) {
+    http_response_code(404);
+    header('Content-Type: text/plain; charset=utf-8');
+    echo "not-found\n";
+    return;
+}
+if (!str_ends_with(strtolower($realFile), '.php') || !is_file($realFile)) {
+    http_response_code(404);
+    header('Content-Type: text/plain; charset=utf-8');
+    echo "not-found\n";
+    return;
+}
+chdir(dirname($realFile));
+require $realFile;

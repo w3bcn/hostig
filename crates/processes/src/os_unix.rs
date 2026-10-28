@@ -33,6 +33,14 @@ pub fn process_image_path(pid: u32) -> Option<PathBuf> {
     }
 }
 
+pub fn send_ctrl_break(_pid: u32) -> Result<()> {
+    Err(ProcessError::new(
+        "ctrl-break solo en Windows",
+        "en Unix Apache recibe SIGWINCH/SIGTERM",
+        "usa el apagado Unix",
+    ))
+}
+
 pub fn terminate_process(pid: u32) -> Result<()> {
     let result = nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(pid as i32),
