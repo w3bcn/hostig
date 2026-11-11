@@ -1,6 +1,7 @@
 //! Instancia MariaDB: config, init, start/stop, preflight y protecciones (3a+3b).
 
 mod config;
+mod health_user;
 mod init;
 mod logparse;
 mod preflight;
@@ -12,6 +13,7 @@ pub use config::{
     generate_my_ini, read_password, regenerate_my_ini, ConfigRegen, InstancePaths,
     DEFAULT_INSTANCE_ID, DEFAULT_PORT,
 };
+pub use health_user::{ensure_health_user, HEALTH_USER};
 pub use init::ensure_initialized;
 pub use logparse::{
     last_nonempty_line, log_contains_crash_recovery, log_contains_fatal_innodb, log_contains_ready,

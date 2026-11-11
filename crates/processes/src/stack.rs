@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::apache::{ApacheService, ApacheStartRequest, ApacheState};
 use crate::error::{ProcessError, Result};
 use crate::mariadb::{
-    read_password, DbService, DbState, InstancePaths, StartRequest as DbStartRequest,
+    ensure_health_user, DbService, DbState, InstancePaths, StartRequest as DbStartRequest,
     DEFAULT_INSTANCE_ID, DEFAULT_MARIADB_VERSION, DEFAULT_PORT as DB_DEFAULT_PORT,
 };
 use crate::php::{PhpService, PhpStartRequest, PhpState};
@@ -247,10 +247,12 @@ impl StackService {
         }
         let php_ports = self.php.ports();
 
-        // Credenciales admin MariaDB para el health.
+        // Usuario dedicado al health (solo USAGE), no la cuenta root.
         let paths = InstancePaths::new(&self.data_dir, DEFAULT_INSTANCE_ID);
-        let password = read_password(&paths).unwrap_or_default();
-        let db_port = self.db.status().port;
+        let db_status = self.db.status();
+        let db_port = db_status.port;
+        let (health_user, health_password) =
+            ensure_health_user(&paths, &self.data_dir, &db_status.version, db_port)?;
 
         // 3. Apache
         let apache_job = self.apache.start_async(ApacheStartRequest {
@@ -258,15 +260,18 @@ impl StackService {
             php_ports,
             db_host: "127.0.0.1".into(),
             db_port,
-            db_user: "root".into(),
-            db_password: password,
+            db_user: health_user,
+            db_password: health_password,
             ..ApacheStartRequest::default()
         })?;
-        wait_apache_job(&self.apache, &apache_job.job_id, Duration::from_secs(120))?;
+        if let Err(error) =
+            wait_apache_job(&self.apache, &apache_job.job_id, Duration::from_secs(120))
+        {
+            let _ = self.run_stop();
+            return Err(error);
+        }
         if self.apache.status().state != ApacheState::Running {
-            let _ = self.apache.stop_async();
-            let _ = self.php.stop_async();
-            let _ = self.db.stop_async();
+            let _ = self.run_stop();
             return Err(ProcessError::new(
                 "Apache no quedó en marcha",
                 self.apache
