@@ -250,9 +250,14 @@ fn ciclo_completo_start_health_stop() {
             "el padre httpd debe haber salido"
         );
     }
-    for child in children {
+    // Tras SetEvent/TerminateProcess el worker puede tardar un instante en salir.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for child in &children {
+        while hostig_ipc::process_is_running(*child) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(100));
+        }
         assert!(
-            !hostig_ipc::process_is_running(child),
+            !hostig_ipc::process_is_running(*child),
             "no debe quedar httpd hijo {child}"
         );
     }
