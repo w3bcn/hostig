@@ -64,7 +64,10 @@ pub fn child_pids(parent_pid: u32) -> Vec<u32> {
                 };
                 if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
                     // Campo 4 (1-based): ppid.
-                    if let Some(ppid) = stat.split_whitespace().nth(3).and_then(|s| s.parse().ok())
+                    if let Some(ppid) = stat
+                        .split_whitespace()
+                        .nth(3)
+                        .and_then(|s| s.parse::<u32>().ok())
                     {
                         if ppid == parent_pid {
                             out.push(pid);
