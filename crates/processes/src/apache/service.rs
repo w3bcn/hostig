@@ -24,14 +24,14 @@ use hostig_runtimes::{runtime_dir, Catalog, MANIFEST_NAME};
 
 pub const TEST_HTTPD_ENV: &str = "HOSTIG_TEST_HTTPD";
 
-/// Vía de apagado en Windows elegida tras la prueba del bloque 4 (ver ADR 0003).
-/// `TerminateProcess` **solo** del PID del `ProcessRecord` (nunca por nombre de imagen).
-/// Se probaron y descartaron: (1) `httpd -k shutdown` — el ZIP Lounge lo asocia al
-/// servicio Windows `Apache2.4`, no al httpd de consola con `-f`; (2) ctrl-break al
-/// grupo — con `CREATE_NO_WINDOW` (ADR 0011) el proceso no tiene consola y
-/// `GenerateConsoleCtrlEvent` no lo detiene. Apache no exige el apagado InnoDB de
-/// MariaDB; cortar el PID registrado libera hijos y el puerto.
-pub const WINDOWS_SHUTDOWN_METHOD: &str = "TerminateProcess del PID registrado";
+/// Vía de apagado en Windows (ver ADR 0003).
+/// Principal: evento nombrado `ap{PID}_shutdown` de mpm_winnt (OpenEvent + SetEvent).
+/// Respaldo tras plazo: `TerminateProcess` **solo** del PID del `ProcessRecord`
+/// (nunca por nombre de imagen). Descartados: (1) `httpd -k shutdown` — el Lounge
+/// lo asocia al servicio Windows `Apache2.4`, no al httpd con `-f`; (2) ctrl-break
+/// — con `CREATE_NO_WINDOW` (ADR 0011) no hay consola que reciba el evento.
+pub const WINDOWS_SHUTDOWN_METHOD: &str =
+    "evento ap<PID>_shutdown; TerminateProcess del PID registrado como respaldo";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -440,21 +440,39 @@ impl ApacheService {
     }
 
     fn run_stop(&self) -> Result<()> {
-        let (id, port, pid, conf, httpd, server_root) = {
+        let (id, port, pid) = {
             let inner = self.inner.lock().expect("apache inner");
-            let id = inner.status.id.clone();
-            let port = inner.status.port;
-            let pid = inner.status.pid;
-            let paths = ApachePaths::new(&self.data_dir, &id);
-            let version = inner.status.version.clone();
-            let (httpd, server_root) = resolve_httpd(&self.data_dir, &self.catalog, &version)
-                .unwrap_or_else(|_| (PathBuf::from("httpd"), self.data_dir.clone()));
-            (id, port, pid, paths.httpd_conf, httpd, server_root)
+            (inner.status.id.clone(), inner.status.port, inner.status.pid)
         };
 
-        // Windows: TerminateProcess del PID registrado (ver WINDOWS_SHUTDOWN_METHOD / ADR 0003).
-        // También se recoge el Child; el hijo worker de mpm_winnt sale con el padre.
-        let _ = (httpd, server_root, conf);
+        // Hijos del padre (mpm_winnt: un worker) antes de pedir apagado.
+        let children_before = pid.map(crate::os::child_pids).unwrap_or_default();
+
+        // 1) Vía principal Windows: evento ap{PID}_shutdown de mpm_winnt.
+        if let Some(pid) = pid {
+            let _ = crate::os::signal_apache_shutdown_event(pid);
+        }
+
+        let graceful_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < graceful_deadline {
+            {
+                let mut inner = self.inner.lock().expect("apache inner");
+                if let Some(child) = inner.child.as_mut() {
+                    let _ = child.try_wait();
+                }
+            }
+            let alive = pid.map(hostig_ipc::process_is_running).unwrap_or(false);
+            let kids_alive = children_before
+                .iter()
+                .any(|&c| hostig_ipc::process_is_running(c));
+            let free = matches!(check_port(port, None), Ok(PortState::Libre));
+            if !alive && !kids_alive && free {
+                return self.finish_stop(&id);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        // 2) Respaldo: TerminateProcess solo del PID registrado (y luego hijos vivos).
         {
             let mut inner = self.inner.lock().expect("apache inner");
             if let Some(mut child) = inner.child.take() {
@@ -464,8 +482,13 @@ impl ApacheService {
                 let _ = crate::os::terminate_process(pid);
             }
         }
+        for child_pid in &children_before {
+            if hostig_ipc::process_is_running(*child_pid) {
+                let _ = crate::os::terminate_process(*child_pid);
+            }
+        }
 
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             {
                 let mut inner = self.inner.lock().expect("apache inner");
@@ -474,15 +497,12 @@ impl ApacheService {
                 }
             }
             let alive = pid.map(hostig_ipc::process_is_running).unwrap_or(false);
+            let kids_alive = children_before
+                .iter()
+                .any(|&c| hostig_ipc::process_is_running(c));
             let free = matches!(check_port(port, None), Ok(PortState::Libre));
-            if !alive && free {
-                let _ = ProcessRecord::remove(&self.data_dir, &id);
-                let mut inner = self.inner.lock().expect("apache inner");
-                if let Some(mut child) = inner.child.take() {
-                    let _ = child.wait();
-                }
-                inner.status.pid = None;
-                return Ok(());
+            if !alive && !kids_alive && free {
+                return self.finish_stop(&id);
             }
             thread::sleep(Duration::from_millis(100));
         }
@@ -491,6 +511,16 @@ impl ApacheService {
             format!("pid={pid:?} puerto={port} tras {WINDOWS_SHUTDOWN_METHOD}"),
             "revisa el error log; no se usa taskkill por nombre",
         ))
+    }
+
+    fn finish_stop(&self, id: &str) -> Result<()> {
+        let _ = ProcessRecord::remove(&self.data_dir, id);
+        let mut inner = self.inner.lock().expect("apache inner");
+        if let Some(mut child) = inner.child.take() {
+            let _ = child.wait();
+        }
+        inner.status.pid = None;
+        Ok(())
     }
 
     fn watchdog_loop(self: &Arc<Self>) {
