@@ -36,7 +36,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/hostig-stack-it-cache
-          key: stack-it-${{ hashFiles('catalog/runtimes.toml') }}-php-8.4.27-apache-2.4.69
+          key: stack-it-${{ hashFiles('catalog/runtimes.toml') }}-php-8.4.27-apache-2.4.70
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
