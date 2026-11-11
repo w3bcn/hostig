@@ -22,7 +22,6 @@ LoadModule rewrite_module modules/mod_rewrite.so
 LoadModule setenvif_module modules/mod_setenvif.so
 
 TypesConfig conf/mime.types
-AddType application/x-httpd-php .php
 
 LogFormat "%h %l %u %t \"%r\" %>s %b" common
 ErrorLog "{{ERROR_LOG}}"
@@ -31,6 +30,8 @@ CustomLog "{{ACCESS_LOG}}" common
 
 ProxyRequests Off
 ProxyPreserveHost On
+# php-cgi (no FPM): evita quirks de FPM en variables FastCGI.
+ProxyFCGIBackendType GENERIC
 
 <Directory />
     AllowOverride none
@@ -43,35 +44,87 @@ DocumentRoot "{{DOCUMENT_ROOT}}"
     AllowOverride All
     Require all granted
     DirectoryIndex index.php index.html
+
+    RewriteEngine On
+    # Un .htaccess con RewriteEngine On no hereda reglas del Directory por
+    # defecto; InheritDownBefore fuerza nuestras reglas (HOSTIG_SCRIPT) antes.
+    RewriteOptions InheritDownBefore
+    # Denegar .php con punto o espacio final: nunca como texto fuente.
+    RewriteRule "(?i)\.php[\. ]$" "-" [F,L]
+    # Antes de SetHandler, guardar la ruta real (C:/...). Tras el proxy,
+    # REQUEST_FILENAME pasa a ser proxy:balancer://... y php-cgi ve "/C:/...".
+    RewriteCond %{REQUEST_FILENAME} -f
+    RewriteRule "(?i)\.php$" "-" [E=HOSTIG_SCRIPT:%{REQUEST_FILENAME},NC]
+    # Front controller (.htaccess → /index.php): fijar HOSTIG_SCRIPT en la
+    # primera pasada; el [E] sobrevive al redirect interno del [L].
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteCond %{DOCUMENT_ROOT}/index.php -f
+    RewriteRule "^" "-" [E=HOSTIG_SCRIPT:%{DOCUMENT_ROOT}/index.php]
+
+    # SetHandler + FilesMatch; (?i) cubre .PHP. Sin AddType ni router.
+    <FilesMatch "(?i)\.php$">
+        <If "-f %{REQUEST_FILENAME}">
+            SetHandler "proxy:balancer://php/"
+            ProxyFCGISetEnvIf "reqenv('HOSTIG_SCRIPT') !~ /^$/" SCRIPT_FILENAME "%{reqenv:HOSTIG_SCRIPT}"
+        </If>
+    </FilesMatch>
 </Directory>
 
-# Router y health fuera del DocumentRoot del usuario (ADR 0003 / 0005).
+# Health fuera del DocumentRoot: Alias evita que un .htaccess de WordPress
+# (RewriteRule . /index.php) capture /__hostig/health bajo el DocumentRoot.
+Alias /__hostig/health "{{HEALTH_PHP}}"
 <Directory "{{HOSTIG_DIR}}">
     Options None
     AllowOverride None
     Require all granted
+    <Files "health.php">
+        SetHandler "proxy:balancer://php/"
+        ProxyFCGISetEnvIf "true" SCRIPT_FILENAME "{{HEALTH_PHP}}"
+    </Files>
 </Directory>
 
-# Pool: cada miembro es php-cgi -b; la ruta C|... apunta al router FastCGI.
-# ProxyFCGISetEnvIf fija SCRIPT_FILENAME (en Windows php-cgi rechaza "/C:/...").
 <Proxy "balancer://php">
 {{BALANCER_MEMBERS}}
     ProxySet lbmethod=byrequests
 </Proxy>
 
-ProxyFCGISetEnvIf "true" SCRIPT_FILENAME "{{ROUTER_PHP}}"
-ProxyPassMatch "^/(.*\.php(/.*)?)$" "balancer://php/"
-ProxyPassMatch "^/__hostig/health$" "balancer://php/"
-
 <VirtualHost 127.0.0.1:{{HTTP_PORT}}>
     DocumentRoot "{{DOCUMENT_ROOT}}"
+    # Contexto de servidor: se reevalúa tras [L] de .htaccess → /index.php.
+    RewriteEngine On
+    RewriteCond %{REQUEST_FILENAME} -f
+    RewriteRule "(?i)\.php$" "-" [E=HOSTIG_SCRIPT:%{REQUEST_FILENAME},NC]
+
     <Directory "{{DOCUMENT_ROOT}}">
         Options Indexes FollowSymLinks
         AllowOverride All
         Require all granted
         DirectoryIndex index.php index.html
+        RewriteEngine On
+        RewriteOptions InheritDownBefore
+        RewriteRule "(?i)\.php[\. ]$" "-" [F,L]
+        RewriteCond %{REQUEST_FILENAME} -f
+        RewriteRule "(?i)\.php$" "-" [E=HOSTIG_SCRIPT:%{REQUEST_FILENAME},NC]
+        RewriteCond %{REQUEST_FILENAME} !-f
+        RewriteCond %{REQUEST_FILENAME} !-d
+        RewriteCond %{DOCUMENT_ROOT}/index.php -f
+        RewriteRule "^" "-" [E=HOSTIG_SCRIPT:%{DOCUMENT_ROOT}/index.php]
+        <FilesMatch "(?i)\.php$">
+            <If "-f %{REQUEST_FILENAME}">
+                SetHandler "proxy:balancer://php/"
+                ProxyFCGISetEnvIf "reqenv('HOSTIG_SCRIPT') !~ /^$/" SCRIPT_FILENAME "%{reqenv:HOSTIG_SCRIPT}"
+            </If>
+        </FilesMatch>
     </Directory>
-    ProxyFCGISetEnvIf "true" SCRIPT_FILENAME "{{ROUTER_PHP}}"
-    ProxyPassMatch "^/(.*\.php(/.*)?)$" "balancer://php/"
-    ProxyPassMatch "^/__hostig/health$" "balancer://php/"
+    Alias /__hostig/health "{{HEALTH_PHP}}"
+    <Directory "{{HOSTIG_DIR}}">
+        Options None
+        AllowOverride None
+        Require all granted
+        <Files "health.php">
+            SetHandler "proxy:balancer://php/"
+            ProxyFCGISetEnvIf "true" SCRIPT_FILENAME "{{HEALTH_PHP}}"
+        </Files>
+    </Directory>
 </VirtualHost>

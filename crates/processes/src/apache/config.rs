@@ -10,7 +10,6 @@ pub const DEFAULT_APACHE_ID: &str = "apache-default";
 const HTTPD_TEMPLATE: &str = include_str!("../../../../templates/apache/httpd.conf.template");
 const HEALTH_TEMPLATE: &str = include_str!("../../../../templates/apache/health.php.template");
 const INDEX_TEMPLATE: &str = include_str!("../../../../templates/apache/index.php.template");
-const ROUTER_TEMPLATE: &str = include_str!("../../../../templates/apache/fcgi-router.php.template");
 
 #[derive(Debug, Clone)]
 pub struct ApachePaths {
@@ -23,7 +22,6 @@ pub struct ApachePaths {
     pub document_root: PathBuf,
     pub hostig_dir: PathBuf,
     pub health_php: PathBuf,
-    pub router_php: PathBuf,
 }
 
 impl ApachePaths {
@@ -39,7 +37,6 @@ impl ApachePaths {
             document_root: data_dir.join("www").join("default"),
             hostig_dir: hostig_dir.clone(),
             health_php: hostig_dir.join("health.php"),
-            router_php: hostig_dir.join("fcgi-router.php"),
             root,
         }
     }
@@ -92,6 +89,13 @@ pub struct HealthDbParams<'a> {
 }
 
 /// Regenera conf, health.php e index.php de bienvenida.
+///
+/// PHP: `<FilesMatch "(?i)\.php$">` + `SetHandler proxy:balancer://php/` y
+/// `ProxyFCGIBackendType GENERIC` (sin router ni ProxyPassMatch). En Windows,
+/// un `RewriteRule` guarda `%{REQUEST_FILENAME}` en `HOSTIG_SCRIPT` (también a
+/// nivel VirtualHost para redirects internos de `.htaccess`) y
+/// `ProxyFCGISetEnvIf` lo restaura como `SCRIPT_FILENAME`. El health usa
+/// `Alias` fuera del DocumentRoot + ruta fija.
 pub fn regenerate_apache_config(
     paths: &ApachePaths,
     server_root: &Path,
@@ -100,12 +104,11 @@ pub fn regenerate_apache_config(
     db: &HealthDbParams<'_>,
 ) -> Result<()> {
     paths.ensure_dirs()?;
-    let router_fcgi = path_fcgi_target(&paths.router_php);
     let members = php_ports
         .iter()
         .map(|p| {
             // disablereuse: evita reutilizar un socket FastCGI tras el reciclado de php-cgi.
-            format!("    BalancerMember fcgi://127.0.0.1:{p}/{router_fcgi} retry=1 disablereuse=On")
+            format!("    BalancerMember fcgi://127.0.0.1:{p}/ retry=1 disablereuse=On")
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -117,7 +120,7 @@ pub fn regenerate_apache_config(
         .replace("{{ACCESS_LOG}}", &path_conf(&paths.access_log))
         .replace("{{DOCUMENT_ROOT}}", &path_conf(&paths.document_root))
         .replace("{{HOSTIG_DIR}}", &path_conf(&paths.hostig_dir))
-        .replace("{{ROUTER_PHP}}", &path_conf(&paths.router_php))
+        .replace("{{HEALTH_PHP}}", &path_conf(&paths.health_php))
         .replace("{{BALANCER_MEMBERS}}", &members);
     fs::write(&paths.httpd_conf, conf.as_bytes())?;
 
@@ -127,17 +130,20 @@ pub fn regenerate_apache_config(
         .replace("{{DB_USER}}", &escape_php_single(db.user))
         .replace("{{DB_PASSWORD}}", &escape_php_single(db.password));
     fs::write(&paths.health_php, health.as_bytes())?;
-
-    let router = ROUTER_TEMPLATE
-        .replace(
-            "{{DOCUMENT_ROOT}}",
-            &escape_php_single(&path_conf(&paths.document_root)),
+    // El health embebe la contraseña de hostig_health: solo el usuario.
+    hostig_ipc::restrict_to_user_and_system(&paths.health_php).map_err(|error| {
+        ProcessError::new(
+            "no se pudieron fijar permisos de health.php",
+            error.to_string(),
+            "revisa la ACL del usuario actual",
         )
-        .replace(
-            "{{HEALTH_PHP}}",
-            &escape_php_single(&path_conf(&paths.health_php)),
-        );
-    fs::write(&paths.router_php, router.as_bytes())?;
+    })?;
+
+    // Eliminar router legado si quedó de una versión anterior.
+    let legacy_router = paths.hostig_dir.join("fcgi-router.php");
+    if legacy_router.is_file() {
+        let _ = fs::remove_file(&legacy_router);
+    }
 
     let index_path = paths.document_root.join("index.php");
     if !index_path.is_file() {
@@ -150,22 +156,6 @@ fn path_conf(path: &Path) -> String {
     path.display().to_string().replace('\\', "/")
 }
 
-/// Ruta para el path de `fcgi://host:port/...` en Windows: `C|/Users/...`.
-fn path_fcgi_target(path: &Path) -> String {
-    let s = path_conf(path);
-    if let Some((drive, rest)) = s.split_once(':') {
-        if drive.len() == 1
-            && drive
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic())
-        {
-            return format!("{drive}|{rest}");
-        }
-    }
-    s
-}
-
 fn escape_php_single(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
 }
@@ -175,7 +165,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn genera_balancer_y_health() {
+    fn genera_balancer_filesmatch_y_health_sin_router() {
         let dir = tempfile::tempdir().unwrap();
         let paths = ApachePaths::new(dir.path(), DEFAULT_APACHE_ID);
         let server = dir.path().join("Apache24");
@@ -188,7 +178,7 @@ mod tests {
             &HealthDbParams {
                 host: "127.0.0.1",
                 port: 3306,
-                user: "root",
+                user: "hostig_health",
                 password: "sec'ret",
             },
         )
@@ -197,15 +187,24 @@ mod tests {
         assert!(
             conf.contains("BalancerMember fcgi://127.0.0.1:9000/")
                 && conf.contains("retry=1")
-                && conf.contains("disablereuse=On")
-                && conf.contains("fcgi-router.php"),
+                && conf.contains("disablereuse=On"),
             "{conf}"
         );
+        assert!(conf.contains("SetHandler \"proxy:balancer://php/\""));
+        assert!(conf.contains("FilesMatch \"(?i)\\.php$\""));
+        assert!(conf.contains("ProxyFCGIBackendType GENERIC"));
+        assert!(conf.contains("RewriteRule \"(?i)\\.php[\\. ]$\" \"-\" [F,L]"));
+        assert!(!conf.contains("ProxyPassMatch \""));
+        assert!(!conf.contains("AddType application/x-httpd-php"));
+        assert!(!conf.contains("fcgi-router"));
+        assert!(conf.contains("Alias /__hostig/health"));
+        assert!(conf.contains("E=HOSTIG_SCRIPT:%{REQUEST_FILENAME}"));
         assert!(conf.contains("Listen 127.0.0.1:8080"));
         assert!(!conf.contains("{{"));
         let health = fs::read_to_string(&paths.health_php).unwrap();
         assert!(health.contains("sec\\'ret"));
+        assert!(health.contains("hostig_health"));
         assert!(paths.document_root.join("index.php").is_file());
-        assert!(paths.router_php.is_file());
+        assert!(!paths.hostig_dir.join("fcgi-router.php").is_file());
     }
 }
