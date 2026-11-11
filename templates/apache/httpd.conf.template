@@ -50,13 +50,27 @@ DocumentRoot "{{DOCUMENT_ROOT}}"
     # defecto; InheritDownBefore fuerza nuestras reglas (HOSTIG_SCRIPT) antes.
     RewriteOptions InheritDownBefore
     # Denegar .php con punto o espacio final: nunca como texto fuente.
+    # En Windows el path se normaliza (strip de espacio/punto); mirar también
+    # THE_REQUEST cruda (.php%20) para no ejecutar config.php por accidente.
     RewriteRule "(?i)\.php[\. ]$" "-" [F,L]
+    RewriteCond %{THE_REQUEST} "(?i)\.php(%20|\.)(?:\s|\?)"
+    RewriteRule "^" "-" [F,L]
     # Antes de SetHandler, guardar la ruta real (C:/...). Tras el proxy,
     # REQUEST_FILENAME pasa a ser proxy:balancer://... y php-cgi ve "/C:/...".
     RewriteCond %{REQUEST_FILENAME} -f
     RewriteRule "(?i)\.php$" "-" [E=HOSTIG_SCRIPT:%{REQUEST_FILENAME},NC]
-    # Front controller (.htaccess → /index.php): fijar HOSTIG_SCRIPT en la
-    # primera pasada; el [E] sobrevive al redirect interno del [L].
+    # WordPress (u otro) en subcarpeta: /blog/slug → /blog/index.php antes de
+    # que el .htaccess de la raíz lo robe hacia /index.php. Usar %1 de
+    # REQUEST_URI (no $1 del path relativo): en el contexto /blog/ el $1 sería
+    # el slug, no el nombre de la carpeta.
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteCond %{REQUEST_URI} "^/([A-Za-z0-9._-]+)/"
+    RewriteCond %{DOCUMENT_ROOT}/%1 -d
+    RewriteCond %{DOCUMENT_ROOT}/%1/index.php -f
+    RewriteRule "^" "/%1/index.php" [E=HOSTIG_SCRIPT:%{DOCUMENT_ROOT}/%1/index.php,L]
+    # Front controller en la raíz (.htaccess → /index.php): fijar HOSTIG_SCRIPT
+    # en la primera pasada; el [E] sobrevive al redirect interno del [L].
     RewriteCond %{REQUEST_FILENAME} !-f
     RewriteCond %{REQUEST_FILENAME} !-d
     RewriteCond %{DOCUMENT_ROOT}/index.php -f
@@ -104,8 +118,16 @@ Alias /__hostig/health "{{HEALTH_PHP}}"
         RewriteEngine On
         RewriteOptions InheritDownBefore
         RewriteRule "(?i)\.php[\. ]$" "-" [F,L]
+        RewriteCond %{THE_REQUEST} "(?i)\.php(%20|\.)(?:\s|\?)"
+        RewriteRule "^" "-" [F,L]
         RewriteCond %{REQUEST_FILENAME} -f
         RewriteRule "(?i)\.php$" "-" [E=HOSTIG_SCRIPT:%{REQUEST_FILENAME},NC]
+        RewriteCond %{REQUEST_FILENAME} !-f
+        RewriteCond %{REQUEST_FILENAME} !-d
+        RewriteCond %{REQUEST_URI} "^/([A-Za-z0-9._-]+)/"
+        RewriteCond %{DOCUMENT_ROOT}/%1 -d
+        RewriteCond %{DOCUMENT_ROOT}/%1/index.php -f
+        RewriteRule "^" "/%1/index.php" [E=HOSTIG_SCRIPT:%{DOCUMENT_ROOT}/%1/index.php,L]
         RewriteCond %{REQUEST_FILENAME} !-f
         RewriteCond %{REQUEST_FILENAME} !-d
         RewriteCond %{DOCUMENT_ROOT}/index.php -f

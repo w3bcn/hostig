@@ -551,6 +551,75 @@ fn subcarpeta_con_index_php_propio() {
     stop_stack(&stack);
 }
 
+/// Caso habitual XAMPP: WordPress en subcarpeta con permalinks, raíz con su
+/// propio front controller, y denegación de `.php` con espacio final.
+#[test]
+fn wordpress_en_subcarpeta_no_roba_la_raiz() {
+    if skip_unless_windows() {
+        return;
+    }
+    allow_job_for_tests();
+    let tmp = data_dir();
+    ensure_stack_runtimes(tmp.path());
+    persist_runtime_cache(tmp.path());
+
+    let www = tmp.path().join("www").join("default");
+    let blog = www.join("blog");
+    std::fs::create_dir_all(&blog).unwrap();
+    std::fs::write(www.join("index.php"), b"<?php echo 'ROOT';\n").unwrap();
+    std::fs::write(
+        www.join(".htaccess"),
+        b"RewriteEngine On\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteCond %{REQUEST_FILENAME} !-d\nRewriteRule . /index.php [L]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        blog.join("index.php"),
+        b"<?php echo 'BLOG:' . ($_SERVER['REQUEST_URI'] ?? '');\n",
+    )
+    .unwrap();
+    std::fs::write(
+        blog.join(".htaccess"),
+        b"RewriteEngine On\nRewriteBase /blog/\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteCond %{REQUEST_FILENAME} !-d\nRewriteRule . /blog/index.php [L]\n",
+    )
+    .unwrap();
+    let secret = "<?php echo 'SECRET_SOURCE_LEAK';";
+    std::fs::write(www.join("config.php"), secret.as_bytes()).unwrap();
+
+    let http_port = hostig_ports::suggest(8088, hostig_ports::ranges::HTTP.clone()).unwrap();
+    let stack = make_stack(tmp.path());
+    let http = start_stack(&stack, http_port, free_port());
+
+    let (code_blog, body_blog) = http_body(http, "/blog/mi-articulo/");
+    assert_eq!(code_blog, 200, "body={body_blog}");
+    assert!(
+        body_blog.contains("BLOG:/blog/mi-articulo/"),
+        "permalink de subcarpeta debe ejecutar blog/index.php: {body_blog}"
+    );
+    assert!(
+        !body_blog.contains("ROOT"),
+        "nunca debe caer en el index de la raíz: {body_blog}"
+    );
+
+    let (code_root, body_root) = http_body(http, "/mi-articulo/");
+    assert_eq!(code_root, 200, "body={body_root}");
+    assert!(
+        body_root.contains("ROOT"),
+        "permalink de la raíz debe ejecutar index.php raíz: {body_root}"
+    );
+
+    let (code_space, body_space) = http_body(http, "/config.php%20");
+    assert!(
+        !body_space.contains("<?php") && !body_space.contains("SECRET_SOURCE_LEAK"),
+        "config.php con espacio final no debe devolver fuente: code={code_space} body={body_space}"
+    );
+    assert!(
+        code_space == 403 || code_space == 404,
+        "esperado 403/404 para .php con espacio: code={code_space} body={body_space}"
+    );
+
+    stop_stack(&stack);
+}
+
 #[test]
 fn health_usa_usuario_dedicado_no_root() {
     if skip_unless_windows() {

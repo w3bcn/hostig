@@ -94,8 +94,10 @@ pub struct HealthDbParams<'a> {
 /// `ProxyFCGIBackendType GENERIC` (sin router ni ProxyPassMatch). En Windows,
 /// un `RewriteRule` guarda `%{REQUEST_FILENAME}` en `HOSTIG_SCRIPT` (también a
 /// nivel VirtualHost para redirects internos de `.htaccess`) y
-/// `ProxyFCGISetEnvIf` lo restaura como `SCRIPT_FILENAME`. El health usa
-/// `Alias` fuera del DocumentRoot + ruta fija.
+/// `ProxyFCGISetEnvIf` lo restaura como `SCRIPT_FILENAME`. Si la URI cae bajo
+/// una subcarpeta con `index.php`, se reescribe a ese front controller antes
+/// del `.htaccess` de la raíz (WordPress en `/blog/`). El health usa `Alias`
+/// fuera del DocumentRoot + ruta fija.
 pub fn regenerate_apache_config(
     paths: &ApachePaths,
     server_root: &Path,
@@ -194,11 +196,14 @@ mod tests {
         assert!(conf.contains("FilesMatch \"(?i)\\.php$\""));
         assert!(conf.contains("ProxyFCGIBackendType GENERIC"));
         assert!(conf.contains("RewriteRule \"(?i)\\.php[\\. ]$\" \"-\" [F,L]"));
+        assert!(conf.contains("THE_REQUEST"));
+        assert!(conf.contains(".php(%20|\\.)"));
         assert!(!conf.contains("ProxyPassMatch \""));
         assert!(!conf.contains("AddType application/x-httpd-php"));
         assert!(!conf.contains("fcgi-router"));
         assert!(conf.contains("Alias /__hostig/health"));
         assert!(conf.contains("E=HOSTIG_SCRIPT:%{REQUEST_FILENAME}"));
+        assert!(conf.contains("E=HOSTIG_SCRIPT:%{DOCUMENT_ROOT}/%1/index.php"));
         assert!(conf.contains("Listen 127.0.0.1:8080"));
         assert!(!conf.contains("{{"));
         let health = fs::read_to_string(&paths.health_php).unwrap();
