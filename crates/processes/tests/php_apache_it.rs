@@ -520,6 +520,10 @@ fn script_filename_and_script_name_son_el_archivo_real() {
         "SCRIPT_FILENAME debe apuntar al archivo real: {body}"
     );
     assert!(
+        !body.contains("SF=/C:") && !body.contains("SF=/c:"),
+        "SCRIPT_FILENAME no debe llevar barra delante de la unidad: {body}"
+    );
+    assert!(
         body.contains("SN=/probe.php") || body.contains("SN=\\probe.php"),
         "SCRIPT_NAME debe ser /probe.php: {body}"
     );
@@ -620,6 +624,116 @@ fn wordpress_en_subcarpeta_no_roba_la_raiz() {
     assert!(
         code_space == 403 || code_space == 404,
         "esperado 403/404 para .php con espacio: code={code_space} body={body_space}"
+    );
+
+    stop_stack(&stack);
+}
+
+/// Sin .htaccess en la subcarpeta: un fichero inexistente es 404, no el index.
+#[test]
+fn subcarpeta_sin_htaccess_inexistente_es_404() {
+    if skip_unless_windows() {
+        return;
+    }
+    allow_job_for_tests();
+    let tmp = data_dir();
+    ensure_stack_runtimes(tmp.path());
+    persist_runtime_cache(tmp.path());
+
+    let docs = tmp.path().join("www").join("default").join("docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(docs.join("index.php"), b"<?php echo 'DOCS-INDEX';\n").unwrap();
+
+    let http_port = hostig_ports::suggest(8089, hostig_ports::ranges::HTTP.clone()).unwrap();
+    let stack = make_stack(tmp.path());
+    let http = start_stack(&stack, http_port, free_port());
+
+    let (code, body) = http_body(http, "/docs/falta.png");
+    assert_eq!(code, 404, "body={body}");
+    assert!(
+        !body.contains("DOCS-INDEX"),
+        "no debe ejecutar index.php de la subcarpeta: {body}"
+    );
+
+    stop_stack(&stack);
+}
+
+/// WordPress a dos niveles de profundidad con RewriteBase propio.
+#[test]
+fn wordpress_a_dos_niveles_con_rewritebase() {
+    if skip_unless_windows() {
+        return;
+    }
+    allow_job_for_tests();
+    let tmp = data_dir();
+    ensure_stack_runtimes(tmp.path());
+    persist_runtime_cache(tmp.path());
+
+    let shop = tmp
+        .path()
+        .join("www")
+        .join("default")
+        .join("clientes")
+        .join("tienda");
+    std::fs::create_dir_all(&shop).unwrap();
+    std::fs::write(
+        shop.join("index.php"),
+        b"<?php echo 'TIENDA:' . ($_SERVER['REQUEST_URI'] ?? '');\n",
+    )
+    .unwrap();
+    std::fs::write(
+        shop.join(".htaccess"),
+        b"RewriteEngine On\nRewriteBase /clientes/tienda/\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteCond %{REQUEST_FILENAME} !-d\nRewriteRule . /clientes/tienda/index.php [L]\n",
+    )
+    .unwrap();
+
+    let http_port = hostig_ports::suggest(8090, hostig_ports::ranges::HTTP.clone()).unwrap();
+    let stack = make_stack(tmp.path());
+    let http = start_stack(&stack, http_port, free_port());
+
+    let (code, body) = http_body(http, "/clientes/tienda/producto/");
+    assert_eq!(code, 200, "body={body}");
+    assert!(
+        body.contains("TIENDA:/clientes/tienda/producto/"),
+        "debe ejecutar el index.php de la tienda: {body}"
+    );
+
+    stop_stack(&stack);
+}
+
+/// Front controller distinto de index.php vía .htaccess.
+#[test]
+fn htaccess_front_controller_app_php() {
+    if skip_unless_windows() {
+        return;
+    }
+    allow_job_for_tests();
+    let tmp = data_dir();
+    ensure_stack_runtimes(tmp.path());
+    persist_runtime_cache(tmp.path());
+
+    let www = tmp.path().join("www").join("default");
+    std::fs::create_dir_all(&www).unwrap();
+    std::fs::write(
+        www.join("app.php"),
+        b"<?php echo 'APP:' . ($_SERVER['REQUEST_URI'] ?? '');\n",
+    )
+    .unwrap();
+    std::fs::write(
+        www.join(".htaccess"),
+        b"RewriteEngine On\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteCond %{REQUEST_FILENAME} !-d\nRewriteRule ^ app.php [L]\n",
+    )
+    .unwrap();
+
+    let http_port = hostig_ports::suggest(8091, hostig_ports::ranges::HTTP.clone()).unwrap();
+    let stack = make_stack(tmp.path());
+    let http = start_stack(&stack, http_port, free_port());
+
+    let (code, body) = http_body(http, "/ruta/amiga/");
+    assert_eq!(code, 200, "body={body}");
+    assert!(
+        body.contains("APP:/ruta/amiga/"),
+        "debe ejecutar app.php: {body}"
     );
 
     stop_stack(&stack);
