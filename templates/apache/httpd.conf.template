@@ -19,7 +19,6 @@ LoadModule proxy_balancer_module modules/mod_proxy_balancer.so
 LoadModule slotmem_shm_module modules/mod_slotmem_shm.so
 LoadModule lbmethod_byrequests_module modules/mod_lbmethod_byrequests.so
 LoadModule rewrite_module modules/mod_rewrite.so
-LoadModule setenvif_module modules/mod_setenvif.so
 
 TypesConfig conf/mime.types
 
@@ -30,13 +29,29 @@ CustomLog "{{ACCESS_LOG}}" common
 
 ProxyRequests Off
 ProxyPreserveHost On
-# php-cgi (no FPM): evita quirks de FPM en variables FastCGI.
+# php-cgi (no FPM): GENERIC evita el prefijo proxy:fcgi:// y el quirks de FPM.
 ProxyFCGIBackendType GENERIC
+# Windows + php-cgi: el worker fcgi://host:port/ + path absoluto produce
+# SCRIPT_FILENAME=//C:/ruta/x.php (una o más barras delante de la unidad).
+# Antes:  SCRIPT_FILENAME=//C:/ruta/x.php  (también /C:/… según el worker)
+# Después: SCRIPT_FILENAME=C:/ruta/x.php
+ProxyFCGISetEnvIf "reqenv('SCRIPT_FILENAME') =~ m#^/+([a-zA-Z]:/.*)$#" SCRIPT_FILENAME "$1"
+ProxyFCGISetEnvIf "reqenv('PATH_TRANSLATED') =~ m#^/+([a-zA-Z]:/.*)$#" PATH_TRANSLATED "$1"
 
 <Directory />
     AllowOverride none
     Require all denied
 </Directory>
+
+# Denegar .php con punto o espacio final (y mayúsculas): sin mod_rewrite,
+# para que un RewriteEngine On del .htaccess del usuario no lo anule.
+<FilesMatch "(?i)\.php[\. ]+$">
+    Require all denied
+</FilesMatch>
+# URI con espacio / %20 / punto final (Windows a menudo normaliza el path a .php).
+<LocationMatch "(?i)\.php(\.|%20| )(/|$)">
+    Require all denied
+</LocationMatch>
 
 DocumentRoot "{{DOCUMENT_ROOT}}"
 <Directory "{{DOCUMENT_ROOT}}">
@@ -45,42 +60,11 @@ DocumentRoot "{{DOCUMENT_ROOT}}"
     Require all granted
     DirectoryIndex index.php index.html
 
-    RewriteEngine On
-    # Un .htaccess con RewriteEngine On no hereda reglas del Directory por
-    # defecto; InheritDownBefore fuerza nuestras reglas (HOSTIG_SCRIPT) antes.
-    RewriteOptions InheritDownBefore
-    # Denegar .php con punto o espacio final: nunca como texto fuente.
-    # En Windows el path se normaliza (strip de espacio/punto); mirar también
-    # THE_REQUEST cruda (.php%20) para no ejecutar config.php por accidente.
-    RewriteRule "(?i)\.php[\. ]$" "-" [F,L]
-    RewriteCond %{THE_REQUEST} "(?i)\.php(%20|\.)(?:\s|\?)"
-    RewriteRule "^" "-" [F,L]
-    # Antes de SetHandler, guardar la ruta real (C:/...). Tras el proxy,
-    # REQUEST_FILENAME pasa a ser proxy:balancer://... y php-cgi ve "/C:/...".
-    RewriteCond %{REQUEST_FILENAME} -f
-    RewriteRule "(?i)\.php$" "-" [E=HOSTIG_SCRIPT:%{REQUEST_FILENAME},NC]
-    # WordPress (u otro) en subcarpeta: /blog/slug → /blog/index.php antes de
-    # que el .htaccess de la raíz lo robe hacia /index.php. Usar %1 de
-    # REQUEST_URI (no $1 del path relativo): en el contexto /blog/ el $1 sería
-    # el slug, no el nombre de la carpeta.
-    RewriteCond %{REQUEST_FILENAME} !-f
-    RewriteCond %{REQUEST_FILENAME} !-d
-    RewriteCond %{REQUEST_URI} "^/([A-Za-z0-9._-]+)/"
-    RewriteCond %{DOCUMENT_ROOT}/%1 -d
-    RewriteCond %{DOCUMENT_ROOT}/%1/index.php -f
-    RewriteRule "^" "/%1/index.php" [E=HOSTIG_SCRIPT:%{DOCUMENT_ROOT}/%1/index.php,L]
-    # Front controller en la raíz (.htaccess → /index.php): fijar HOSTIG_SCRIPT
-    # en la primera pasada; el [E] sobrevive al redirect interno del [L].
-    RewriteCond %{REQUEST_FILENAME} !-f
-    RewriteCond %{REQUEST_FILENAME} !-d
-    RewriteCond %{DOCUMENT_ROOT}/index.php -f
-    RewriteRule "^" "-" [E=HOSTIG_SCRIPT:%{DOCUMENT_ROOT}/index.php]
-
-    # SetHandler + FilesMatch; (?i) cubre .PHP. Sin AddType ni router.
+    # SetHandler + FilesMatch; (?i) cubre .PHP. Sin AddType, ProxyPassMatch ni router.
+    # Sin RewriteRule de Hostig: los .htaccess del usuario se comportan como en Apache.
     <FilesMatch "(?i)\.php$">
         <If "-f %{REQUEST_FILENAME}">
             SetHandler "proxy:balancer://php/"
-            ProxyFCGISetEnvIf "reqenv('HOSTIG_SCRIPT') !~ /^$/" SCRIPT_FILENAME "%{reqenv:HOSTIG_SCRIPT}"
         </If>
     </FilesMatch>
 </Directory>
@@ -105,37 +89,18 @@ Alias /__hostig/health "{{HEALTH_PHP}}"
 
 <VirtualHost 127.0.0.1:{{HTTP_PORT}}>
     DocumentRoot "{{DOCUMENT_ROOT}}"
-    # Contexto de servidor: se reevalúa tras [L] de .htaccess → /index.php.
-    RewriteEngine On
-    RewriteCond %{REQUEST_FILENAME} -f
-    RewriteRule "(?i)\.php$" "-" [E=HOSTIG_SCRIPT:%{REQUEST_FILENAME},NC]
+    ProxyFCGIBackendType GENERIC
+    ProxyFCGISetEnvIf "reqenv('SCRIPT_FILENAME') =~ m#^/+([a-zA-Z]:/.*)$#" SCRIPT_FILENAME "$1"
+    ProxyFCGISetEnvIf "reqenv('PATH_TRANSLATED') =~ m#^/+([a-zA-Z]:/.*)$#" PATH_TRANSLATED "$1"
 
     <Directory "{{DOCUMENT_ROOT}}">
         Options Indexes FollowSymLinks
         AllowOverride All
         Require all granted
         DirectoryIndex index.php index.html
-        RewriteEngine On
-        RewriteOptions InheritDownBefore
-        RewriteRule "(?i)\.php[\. ]$" "-" [F,L]
-        RewriteCond %{THE_REQUEST} "(?i)\.php(%20|\.)(?:\s|\?)"
-        RewriteRule "^" "-" [F,L]
-        RewriteCond %{REQUEST_FILENAME} -f
-        RewriteRule "(?i)\.php$" "-" [E=HOSTIG_SCRIPT:%{REQUEST_FILENAME},NC]
-        RewriteCond %{REQUEST_FILENAME} !-f
-        RewriteCond %{REQUEST_FILENAME} !-d
-        RewriteCond %{REQUEST_URI} "^/([A-Za-z0-9._-]+)/"
-        RewriteCond %{DOCUMENT_ROOT}/%1 -d
-        RewriteCond %{DOCUMENT_ROOT}/%1/index.php -f
-        RewriteRule "^" "/%1/index.php" [E=HOSTIG_SCRIPT:%{DOCUMENT_ROOT}/%1/index.php,L]
-        RewriteCond %{REQUEST_FILENAME} !-f
-        RewriteCond %{REQUEST_FILENAME} !-d
-        RewriteCond %{DOCUMENT_ROOT}/index.php -f
-        RewriteRule "^" "-" [E=HOSTIG_SCRIPT:%{DOCUMENT_ROOT}/index.php]
         <FilesMatch "(?i)\.php$">
             <If "-f %{REQUEST_FILENAME}">
                 SetHandler "proxy:balancer://php/"
-                ProxyFCGISetEnvIf "reqenv('HOSTIG_SCRIPT') !~ /^$/" SCRIPT_FILENAME "%{reqenv:HOSTIG_SCRIPT}"
             </If>
         </FilesMatch>
     </Directory>

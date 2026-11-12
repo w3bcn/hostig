@@ -92,12 +92,11 @@ pub struct HealthDbParams<'a> {
 ///
 /// PHP: `<FilesMatch "(?i)\.php$">` + `SetHandler proxy:balancer://php/` y
 /// `ProxyFCGIBackendType GENERIC` (sin router ni ProxyPassMatch). En Windows,
-/// un `RewriteRule` guarda `%{REQUEST_FILENAME}` en `HOSTIG_SCRIPT` (también a
-/// nivel VirtualHost para redirects internos de `.htaccess`) y
-/// `ProxyFCGISetEnvIf` lo restaura como `SCRIPT_FILENAME`. Si la URI cae bajo
-/// una subcarpeta con `index.php`, se reescribe a ese front controller antes
-/// del `.htaccess` de la raíz (WordPress en `/blog/`). El health usa `Alias`
-/// fuera del DocumentRoot + ruta fija.
+/// `ProxyFCGISetEnvIf` quita la barra de `SCRIPT_FILENAME`/`PATH_TRANSLATED`
+/// cuando llegan como `/C:/...` (php-cgi). No hay `RewriteRule` de Hostig ni
+/// `HOSTIG_SCRIPT`: los `.htaccess` del usuario se comportan como en Apache.
+/// `.php` con punto/espacio final se deniega con `FilesMatch`/`LocationMatch`
+/// a nivel de servidor. El health usa `Alias` fuera del DocumentRoot.
 pub fn regenerate_apache_config(
     paths: &ApachePaths,
     server_root: &Path,
@@ -109,8 +108,9 @@ pub fn regenerate_apache_config(
     let members = php_ports
         .iter()
         .map(|p| {
+            // Sin barra final: con "/" Apache arma fcgi://host:port//C:/... en Windows.
             // disablereuse: evita reutilizar un socket FastCGI tras el reciclado de php-cgi.
-            format!("    BalancerMember fcgi://127.0.0.1:{p}/ retry=1 disablereuse=On")
+            format!("    BalancerMember fcgi://127.0.0.1:{p} retry=1 disablereuse=On")
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -187,7 +187,7 @@ mod tests {
         .unwrap();
         let conf = fs::read_to_string(&paths.httpd_conf).unwrap();
         assert!(
-            conf.contains("BalancerMember fcgi://127.0.0.1:9000/")
+            conf.contains("BalancerMember fcgi://127.0.0.1:9000 ")
                 && conf.contains("retry=1")
                 && conf.contains("disablereuse=On"),
             "{conf}"
@@ -195,15 +195,17 @@ mod tests {
         assert!(conf.contains("SetHandler \"proxy:balancer://php/\""));
         assert!(conf.contains("FilesMatch \"(?i)\\.php$\""));
         assert!(conf.contains("ProxyFCGIBackendType GENERIC"));
-        assert!(conf.contains("RewriteRule \"(?i)\\.php[\\. ]$\" \"-\" [F,L]"));
-        assert!(conf.contains("THE_REQUEST"));
-        assert!(conf.contains(".php(%20|\\.)"));
+        assert!(conf.contains("FilesMatch \"(?i)\\.php[\\. ]+$\""));
+        assert!(conf.contains("LocationMatch \"(?i)\\.php(\\.|%20| )(/|$)\""));
+        assert!(conf.contains("SCRIPT_FILENAME \"$1\""));
+        assert!(conf.contains("PATH_TRANSLATED \"$1\""));
+        assert!(conf.contains("^/+([a-zA-Z]:/.*)$"));
+        assert!(!conf.contains("HOSTIG_SCRIPT"));
+        assert!(!conf.contains("InheritDownBefore"));
         assert!(!conf.contains("ProxyPassMatch \""));
         assert!(!conf.contains("AddType application/x-httpd-php"));
         assert!(!conf.contains("fcgi-router"));
         assert!(conf.contains("Alias /__hostig/health"));
-        assert!(conf.contains("E=HOSTIG_SCRIPT:%{REQUEST_FILENAME}"));
-        assert!(conf.contains("E=HOSTIG_SCRIPT:%{DOCUMENT_ROOT}/%1/index.php"));
         assert!(conf.contains("Listen 127.0.0.1:8080"));
         assert!(!conf.contains("{{"));
         let health = fs::read_to_string(&paths.health_php).unwrap();
