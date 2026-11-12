@@ -6,16 +6,16 @@
 
 [[runtime]]
 component = "apache"
-version = "2.4.69"
+version = "2.4.70"
 os = "windows"
 arch = "x86_64"
 urls = [
-  "https://www.apachelounge.com/download/VS18/binaries/httpd-2.4.69-261002-win64-VS18.zip",
+  "https://www.apachelounge.com/download/VS18/binaries/httpd-2.4.70-261106-Win64-VS18.zip",
 ]
-filename = "httpd-2.4.69-261002-win64-VS18.zip"
-sha256 = "77d715d0d9cee731e2251e7ddc2090a7a8e6d41fedef2e9827cd918593c5a652"
+filename = "httpd-2.4.70-261106-Win64-VS18.zip"
+sha256 = "b96a40b66a99428b2e4aea48ebe98bab826c768df4ace81f78dd7e26a98ad311"
 license = "Apache-2.0"
-notes = "ZIP Win64 de Apache Lounge (VS18 / Visual Studio C++ 2026), no binario de la ASF. Exige el redistribuible VC++ 14.51+ (etiqueta Visual Studio 2017-2026). El ZIP no incluye esas DLL: el ADR 0002 manda llevarlas en la carpeta del runtime junto a httpd.exe (copia local desde el redistribuible, sin ejecutar vc_redist). SHA-256 recalculado 2026-10-28 sobre la URL del catálogo (el publicador regeneró el ZIP)."
+notes = "ZIP Win64 de Apache Lounge (VS18 / Visual Studio C++ 2026), build 261106 del 6 Nov 2026, no binario de la ASF. Exige el redistribuible VC++ 14.51+ (etiqueta Visual Studio 2017-2026). SHA-256 contrastado 2026-11-11 con el fichero de checksums del publicador (httpd-2.4.70-261106-Win64-VS18.zip.txt en la misma carpeta de descarga; también hay .asc PGP firmado por Steffen Land) y con el hash del ZIP descargado."
 
 [[runtime]]
 component = "php"

@@ -15,6 +15,16 @@ pub fn terminate_process(pid: u32) -> Result<()> {
     platform::terminate_process(pid)
 }
 
+/// Windows: activa `ap{pid}_shutdown` (mpm_winnt). Unix: no-op.
+pub fn signal_apache_shutdown_event(pid: u32) -> Result<()> {
+    platform::signal_apache_shutdown_event(pid)
+}
+
+/// PIDs hijos directos de `parent_pid`.
+pub fn child_pids(parent_pid: u32) -> Vec<u32> {
+    platform::child_pids(parent_pid)
+}
+
 /// Windows: ctrl-break al grupo de proceso. Unix: no-op (se usa señal en Apache).
 #[allow(dead_code)]
 pub fn send_ctrl_break(process_group_pid: u32) -> Result<()> {
@@ -47,6 +57,18 @@ mod platform {
             "terminate no disponible",
             "usa Windows, Linux o macOS",
         ))
+    }
+
+    pub fn signal_apache_shutdown_event(_pid: u32) -> Result<()> {
+        Err(ProcessError::new(
+            "plataforma no soportada",
+            "evento de apagado Apache no disponible",
+            "usa Windows",
+        ))
+    }
+
+    pub fn child_pids(_parent_pid: u32) -> Vec<u32> {
+        Vec::new()
     }
 
     pub fn send_ctrl_break(_pid: u32) -> Result<()> {

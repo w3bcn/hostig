@@ -1,4 +1,4 @@
-//! Integración PHP + Apache (bloque 4). En Linux/macOS se saltan hasta la fase 1b.
+//! Integración PHP + Apache (bloque 4 + revisión). En Linux/macOS se saltan hasta la fase 1b.
 //!
 //! Requiere `HOSTIG_ALLOW_JOB_WITHOUT_BREAKAWAY=1` en CI/IDE (ADR 0011).
 
@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hostig_ports::{check as check_port, PortState};
-use hostig_processes::apache::{ApacheSettings, ApacheState};
+use hostig_processes::apache::{self, ApacheSettings, ApacheState};
 use hostig_processes::mariadb::{DbService, DbState, DEFAULT_MARIADB_VERSION};
 use hostig_processes::php::{PhpSettings, PhpState, DEFAULT_PHP_VERSION};
 use hostig_processes::{StackService, StackStartRequest, ALLOW_JOB_WITHOUT_BREAKAWAY_ENV};
@@ -41,7 +41,6 @@ fn data_dir() -> tempfile::TempDir {
         }
         return tmp;
     }
-    // Reutilizar caché MariaDB si existe.
     if let Ok(cache) = std::env::var("HOSTIG_MARIADB_IT_CACHE") {
         let path = PathBuf::from(cache);
         let tmp = tempfile::tempdir().expect("tmp");
@@ -103,7 +102,7 @@ fn ensure_runtime(data: &Path, component: &str, version: &str) {
 fn ensure_stack_runtimes(data: &Path) {
     ensure_runtime(data, "mariadb", DEFAULT_MARIADB_VERSION);
     ensure_runtime(data, "php", DEFAULT_PHP_VERSION);
-    ensure_runtime(data, "apache", "2.4.69");
+    ensure_runtime(data, "apache", "2.4.70");
 }
 
 fn free_port() -> u16 {
@@ -147,12 +146,20 @@ fn http_get(port: u16, path: &str) -> (u16, String) {
     (code, text)
 }
 
+fn http_body(port: u16, path: &str) -> (u16, String) {
+    let (code, raw) = http_get(port, path);
+    let body = raw
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    (code, body)
+}
+
 fn make_stack(data: &Path) -> Arc<StackService> {
     let db = Arc::new(DbService::with_embedded(data).expect("db"));
     let php = Arc::new(hostig_processes::php::PhpService::with_embedded(data).expect("php"));
     let apache =
         Arc::new(hostig_processes::apache::ApacheService::with_embedded(data).expect("apache"));
-    // Plazos cortos en IT donde aplica.
     php.set_settings_for_tests(PhpSettings {
         pool_size: 2,
         start_total_secs: 60,
@@ -170,6 +177,24 @@ fn make_stack(data: &Path) -> Arc<StackService> {
     Arc::new(StackService::new(data, db, php, apache))
 }
 
+fn start_stack(stack: &Arc<StackService>, http_port: u16, db_port: u16) -> u16 {
+    let job = stack
+        .start_async(StackStartRequest {
+            http_port: Some(http_port),
+            db_port: Some(db_port),
+            php_pool_size: Some(2),
+            ..StackStartRequest::default()
+        })
+        .expect("start");
+    wait_stack_job(stack, &job.job_id, Duration::from_secs(300));
+    stack.apache.status().port
+}
+
+fn stop_stack(stack: &Arc<StackService>) {
+    let stop = stack.stop_async().expect("stop");
+    wait_stack_job(stack, &stop.job_id, Duration::from_secs(120));
+}
+
 #[test]
 fn ciclo_completo_start_health_stop() {
     if skip_unless_windows() {
@@ -180,7 +205,6 @@ fn ciclo_completo_start_health_stop() {
     ensure_stack_runtimes(tmp.path());
     persist_runtime_cache(tmp.path());
 
-    // Puerto HTTP dentro del rango ADR 0004.
     let http_port = hostig_ports::suggest(8080, hostig_ports::ranges::HTTP.clone()).unwrap_or(8080);
     let db_port = free_port();
     let stack = make_stack(tmp.path());
@@ -209,6 +233,7 @@ fn ciclo_completo_start_health_stop() {
         .get("pid")
         .and_then(|v| v.as_u64())
         .map(|p| p as u32);
+    let children = apache_pid.map(apache::child_pids).unwrap_or_default();
 
     let stop = stack.stop_async().expect("stop");
     wait_stack_job(&stack, &stop.job_id, Duration::from_secs(120));
@@ -220,7 +245,21 @@ fn ciclo_completo_start_health_stop() {
         assert!(!hostig_ipc::process_is_running(pid));
     }
     if let Some(pid) = apache_pid {
-        assert!(!hostig_ipc::process_is_running(pid));
+        assert!(
+            !hostig_ipc::process_is_running(pid),
+            "el padre httpd debe haber salido"
+        );
+    }
+    // Tras SetEvent/TerminateProcess el worker puede tardar un instante en salir.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for child in &children {
+        while hostig_ipc::process_is_running(*child) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            !hostig_ipc::process_is_running(*child),
+            "no debe quedar httpd hijo {child}"
+        );
     }
     assert!(matches!(check_port(http, None), Ok(PortState::Libre)));
     assert!(matches!(check_port(db_port, None), Ok(PortState::Libre)));
@@ -239,7 +278,6 @@ fn reciclado_fcgi_max_requests_no_cuenta_backoff() {
     let http_port = hostig_ports::suggest(8081, hostig_ports::ranges::HTTP.clone()).unwrap();
     let db_port = free_port();
     let stack = make_stack(tmp.path());
-    // Pool pequeño y MAX_REQUESTS bajo para forzar reciclado.
     stack
         .php
         .set_settings_for_tests(PhpSettings {
@@ -266,15 +304,13 @@ fn reciclado_fcgi_max_requests_no_cuenta_backoff() {
         let (code, body) = http_get(http, "/");
         assert_eq!(code, 200, "petición {i}: {body}");
     }
-    // Tras 200 peticiones con MAX_REQUESTS=20 debe haber reciclados; no caídas.
     assert_eq!(
         stack.php.crash_restart_count(),
         0,
         "el reciclado no debe contar para el backoff"
     );
 
-    let stop = stack.stop_async().expect("stop");
-    wait_stack_job(&stack, &stop.job_id, Duration::from_secs(120));
+    stop_stack(&stack);
 }
 
 #[test]
@@ -300,21 +336,12 @@ fn muerte_php_cgi_reinicia_y_apache_sigue() {
         })
         .unwrap();
 
-    let job = stack
-        .start_async(StackStartRequest {
-            http_port: Some(http_port),
-            db_port: Some(db_port),
-            php_pool_size: Some(2),
-            ..StackStartRequest::default()
-        })
-        .expect("start");
-    wait_stack_job(&stack, &job.job_id, Duration::from_secs(300));
+    let http = start_stack(&stack, http_port, db_port);
 
     let workers = stack.php.status().workers;
     assert!(workers.len() >= 2);
     let victim_id = workers[0].id.clone();
     let victim = workers[0].pid.expect("pid");
-    // Muerte no reciclada: solo el PID registrado (no taskkill por nombre).
     hostig_processes::emergency_kill(tmp.path(), &victim_id, victim).expect("matar worker");
 
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -329,13 +356,11 @@ fn muerte_php_cgi_reinicia_y_apache_sigue() {
         "la muerte debe contar para el backoff"
     );
 
-    let http = stack.apache.status().port;
     let (code, body) = http_get(http, "/");
     assert_eq!(code, 200, "Apache debe seguir sirviendo: {body}");
     assert_eq!(stack.php.status().state, PhpState::Running);
 
-    let stop = stack.stop_async().expect("stop");
-    wait_stack_job(&stack, &stop.job_id, Duration::from_secs(120));
+    stop_stack(&stack);
 }
 
 #[test]
@@ -345,7 +370,6 @@ fn puerto_http_ocupado_no_lanza_nada() {
     }
     allow_job_for_tests();
     let tmp = data_dir();
-    // No hace falta instalar runtimes: debe fallar antes.
     let listener = TcpListener::bind(("127.0.0.1", 8080)).expect("hold 8080");
     let _ = &listener;
     thread::sleep(Duration::from_millis(50));
@@ -372,14 +396,384 @@ fn puerto_http_ocupado_no_lanza_nada() {
 }
 
 #[test]
-fn apagado_apache_usa_httpd_k_shutdown() {
+fn apagado_apache_usa_evento_mpm_winnt() {
     if skip_unless_windows() {
         return;
     }
     assert_eq!(
         hostig_processes::apache::WINDOWS_SHUTDOWN_METHOD,
-        "TerminateProcess del PID registrado"
+        "evento ap<PID>_shutdown; TerminateProcess del PID registrado como respaldo"
     );
-    // Descartados en la prueba del bloque 4: httpd -k shutdown (servicio Windows)
-    // y ctrl-break (CREATE_NO_WINDOW sin consola).
+}
+
+#[test]
+fn rewrite_wordpress_index_php_front_controller() {
+    if skip_unless_windows() {
+        return;
+    }
+    allow_job_for_tests();
+    let tmp = data_dir();
+    ensure_stack_runtimes(tmp.path());
+    persist_runtime_cache(tmp.path());
+
+    // .htaccess tipo WordPress presente antes del arranque: no debe romper el health
+    // (Alias saca /__hostig/health del DocumentRoot).
+    let www = tmp.path().join("www").join("default");
+    std::fs::create_dir_all(&www).unwrap();
+    std::fs::write(
+        www.join("index.php"),
+        b"<?php echo 'WP-FRONT:' . ($_SERVER['REQUEST_URI'] ?? '');\n",
+    )
+    .unwrap();
+    std::fs::write(
+        www.join(".htaccess"),
+        b"RewriteEngine On\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteCond %{REQUEST_FILENAME} !-d\nRewriteRule . /index.php [L]\n",
+    )
+    .unwrap();
+
+    let http_port = hostig_ports::suggest(8083, hostig_ports::ranges::HTTP.clone()).unwrap();
+    let stack = make_stack(tmp.path());
+    let http = start_stack(&stack, http_port, free_port());
+
+    let (code, body) = http_body(http, "/mi-articulo/");
+    assert_eq!(code, 200, "body={body}");
+    assert!(
+        body.contains("WP-FRONT:") && body.contains("/mi-articulo/"),
+        "debe ejecutar index.php vía rewrite: {body}"
+    );
+
+    stop_stack(&stack);
+}
+
+#[test]
+fn php_extension_case_and_trailing_junk_not_source() {
+    if skip_unless_windows() {
+        return;
+    }
+    allow_job_for_tests();
+    let tmp = data_dir();
+    ensure_stack_runtimes(tmp.path());
+    persist_runtime_cache(tmp.path());
+
+    let www = tmp.path().join("www").join("default");
+    std::fs::create_dir_all(&www).unwrap();
+    let secret = "<?php echo 'SECRET_SOURCE_LEAK';";
+    // Windows: crear config.PHP (misma entrada NTFS que .php en muchos volúmenes).
+    std::fs::write(www.join("config.PHP"), secret.as_bytes()).unwrap();
+    // Nombre con punto final: en NTFS a menudo se normaliza; si el archivo existe, denegar.
+    let _ = std::fs::write(www.join("config.php."), secret.as_bytes());
+
+    let http_port = hostig_ports::suggest(8084, hostig_ports::ranges::HTTP.clone()).unwrap();
+    let stack = make_stack(tmp.path());
+    let http = start_stack(&stack, http_port, free_port());
+
+    let (code_upper, body_upper) = http_body(http, "/config.PHP");
+    assert!(
+        !body_upper.contains("<?php"),
+        "config.PHP no debe devolver fuente: code={code_upper} body={body_upper}"
+    );
+    // Si se ejecutó como PHP, no hay <?php en la salida; si 403/404, tampoco.
+    assert!(
+        code_upper == 200 || code_upper == 403 || code_upper == 404,
+        "code={code_upper}"
+    );
+
+    let (code_dot, body_dot) = http_body(http, "/config.php.");
+    assert!(
+        !body_dot.contains("<?php"),
+        "config.php. no debe devolver fuente: code={code_dot} body={body_dot}"
+    );
+    assert!(
+        code_dot == 403 || code_dot == 404 || code_dot == 200,
+        "code={code_dot}"
+    );
+
+    stop_stack(&stack);
+}
+
+#[test]
+fn script_filename_and_script_name_son_el_archivo_real() {
+    if skip_unless_windows() {
+        return;
+    }
+    allow_job_for_tests();
+    let tmp = data_dir();
+    ensure_stack_runtimes(tmp.path());
+    persist_runtime_cache(tmp.path());
+
+    let www = tmp.path().join("www").join("default");
+    std::fs::create_dir_all(&www).unwrap();
+    std::fs::write(
+        www.join("probe.php"),
+        b"<?php echo 'SF=' . ($_SERVER['SCRIPT_FILENAME'] ?? '') . '|SN=' . ($_SERVER['SCRIPT_NAME'] ?? '');\n",
+    )
+    .unwrap();
+
+    let http_port = hostig_ports::suggest(8085, hostig_ports::ranges::HTTP.clone()).unwrap();
+    let stack = make_stack(tmp.path());
+    let http = start_stack(&stack, http_port, free_port());
+
+    let (code, body) = http_body(http, "/probe.php");
+    assert_eq!(code, 200, "body={body}");
+    assert!(
+        body.contains("probe.php") && body.contains("SF="),
+        "SCRIPT_FILENAME debe apuntar al archivo real: {body}"
+    );
+    assert!(
+        !body.contains("SF=/C:") && !body.contains("SF=/c:"),
+        "SCRIPT_FILENAME no debe llevar barra delante de la unidad: {body}"
+    );
+    assert!(
+        body.contains("SN=/probe.php") || body.contains("SN=\\probe.php"),
+        "SCRIPT_NAME debe ser /probe.php: {body}"
+    );
+    assert!(
+        !body.contains("fcgi-router"),
+        "no debe usar el router legado: {body}"
+    );
+
+    stop_stack(&stack);
+}
+
+#[test]
+fn subcarpeta_con_index_php_propio() {
+    if skip_unless_windows() {
+        return;
+    }
+    allow_job_for_tests();
+    let tmp = data_dir();
+    ensure_stack_runtimes(tmp.path());
+    persist_runtime_cache(tmp.path());
+
+    let sub = tmp.path().join("www").join("default").join("tienda");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("index.php"), b"<?php echo 'SUBDIR-OK';\n").unwrap();
+
+    let http_port = hostig_ports::suggest(8086, hostig_ports::ranges::HTTP.clone()).unwrap();
+    let stack = make_stack(tmp.path());
+    let http = start_stack(&stack, http_port, free_port());
+
+    let (code, body) = http_body(http, "/tienda/");
+    assert_eq!(code, 200, "body={body}");
+    assert!(body.contains("SUBDIR-OK"), "body={body}");
+
+    stop_stack(&stack);
+}
+
+/// Caso habitual XAMPP: WordPress en subcarpeta con permalinks, raíz con su
+/// propio front controller, y denegación de `.php` con espacio final.
+#[test]
+fn wordpress_en_subcarpeta_no_roba_la_raiz() {
+    if skip_unless_windows() {
+        return;
+    }
+    allow_job_for_tests();
+    let tmp = data_dir();
+    ensure_stack_runtimes(tmp.path());
+    persist_runtime_cache(tmp.path());
+
+    let www = tmp.path().join("www").join("default");
+    let blog = www.join("blog");
+    std::fs::create_dir_all(&blog).unwrap();
+    std::fs::write(www.join("index.php"), b"<?php echo 'ROOT';\n").unwrap();
+    std::fs::write(
+        www.join(".htaccess"),
+        b"RewriteEngine On\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteCond %{REQUEST_FILENAME} !-d\nRewriteRule . /index.php [L]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        blog.join("index.php"),
+        b"<?php echo 'BLOG:' . ($_SERVER['REQUEST_URI'] ?? '');\n",
+    )
+    .unwrap();
+    std::fs::write(
+        blog.join(".htaccess"),
+        b"RewriteEngine On\nRewriteBase /blog/\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteCond %{REQUEST_FILENAME} !-d\nRewriteRule . /blog/index.php [L]\n",
+    )
+    .unwrap();
+    let secret = "<?php echo 'SECRET_SOURCE_LEAK';";
+    std::fs::write(www.join("config.php"), secret.as_bytes()).unwrap();
+
+    let http_port = hostig_ports::suggest(8088, hostig_ports::ranges::HTTP.clone()).unwrap();
+    let stack = make_stack(tmp.path());
+    let http = start_stack(&stack, http_port, free_port());
+
+    let (code_blog, body_blog) = http_body(http, "/blog/mi-articulo/");
+    assert_eq!(code_blog, 200, "body={body_blog}");
+    assert!(
+        body_blog.contains("BLOG:/blog/mi-articulo/"),
+        "permalink de subcarpeta debe ejecutar blog/index.php: {body_blog}"
+    );
+    assert!(
+        !body_blog.contains("ROOT"),
+        "nunca debe caer en el index de la raíz: {body_blog}"
+    );
+
+    let (code_root, body_root) = http_body(http, "/mi-articulo/");
+    assert_eq!(code_root, 200, "body={body_root}");
+    assert!(
+        body_root.contains("ROOT"),
+        "permalink de la raíz debe ejecutar index.php raíz: {body_root}"
+    );
+
+    let (code_space, body_space) = http_body(http, "/config.php%20");
+    assert!(
+        !body_space.contains("<?php") && !body_space.contains("SECRET_SOURCE_LEAK"),
+        "config.php con espacio final no debe devolver fuente: code={code_space} body={body_space}"
+    );
+    assert!(
+        code_space == 403 || code_space == 404,
+        "esperado 403/404 para .php con espacio: code={code_space} body={body_space}"
+    );
+
+    stop_stack(&stack);
+}
+
+/// Sin .htaccess en la subcarpeta: un fichero inexistente es 404, no el index.
+#[test]
+fn subcarpeta_sin_htaccess_inexistente_es_404() {
+    if skip_unless_windows() {
+        return;
+    }
+    allow_job_for_tests();
+    let tmp = data_dir();
+    ensure_stack_runtimes(tmp.path());
+    persist_runtime_cache(tmp.path());
+
+    let docs = tmp.path().join("www").join("default").join("docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(docs.join("index.php"), b"<?php echo 'DOCS-INDEX';\n").unwrap();
+
+    let http_port = hostig_ports::suggest(8089, hostig_ports::ranges::HTTP.clone()).unwrap();
+    let stack = make_stack(tmp.path());
+    let http = start_stack(&stack, http_port, free_port());
+
+    let (code, body) = http_body(http, "/docs/falta.png");
+    assert_eq!(code, 404, "body={body}");
+    assert!(
+        !body.contains("DOCS-INDEX"),
+        "no debe ejecutar index.php de la subcarpeta: {body}"
+    );
+
+    stop_stack(&stack);
+}
+
+/// WordPress a dos niveles de profundidad con RewriteBase propio.
+#[test]
+fn wordpress_a_dos_niveles_con_rewritebase() {
+    if skip_unless_windows() {
+        return;
+    }
+    allow_job_for_tests();
+    let tmp = data_dir();
+    ensure_stack_runtimes(tmp.path());
+    persist_runtime_cache(tmp.path());
+
+    let shop = tmp
+        .path()
+        .join("www")
+        .join("default")
+        .join("clientes")
+        .join("tienda");
+    std::fs::create_dir_all(&shop).unwrap();
+    std::fs::write(
+        shop.join("index.php"),
+        b"<?php echo 'TIENDA:' . ($_SERVER['REQUEST_URI'] ?? '');\n",
+    )
+    .unwrap();
+    std::fs::write(
+        shop.join(".htaccess"),
+        b"RewriteEngine On\nRewriteBase /clientes/tienda/\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteCond %{REQUEST_FILENAME} !-d\nRewriteRule . /clientes/tienda/index.php [L]\n",
+    )
+    .unwrap();
+
+    let http_port = hostig_ports::suggest(8090, hostig_ports::ranges::HTTP.clone()).unwrap();
+    let stack = make_stack(tmp.path());
+    let http = start_stack(&stack, http_port, free_port());
+
+    let (code, body) = http_body(http, "/clientes/tienda/producto/");
+    assert_eq!(code, 200, "body={body}");
+    assert!(
+        body.contains("TIENDA:/clientes/tienda/producto/"),
+        "debe ejecutar el index.php de la tienda: {body}"
+    );
+
+    stop_stack(&stack);
+}
+
+/// Front controller distinto de index.php vía .htaccess.
+#[test]
+fn htaccess_front_controller_app_php() {
+    if skip_unless_windows() {
+        return;
+    }
+    allow_job_for_tests();
+    let tmp = data_dir();
+    ensure_stack_runtimes(tmp.path());
+    persist_runtime_cache(tmp.path());
+
+    let www = tmp.path().join("www").join("default");
+    std::fs::create_dir_all(&www).unwrap();
+    std::fs::write(
+        www.join("app.php"),
+        b"<?php echo 'APP:' . ($_SERVER['REQUEST_URI'] ?? '');\n",
+    )
+    .unwrap();
+    std::fs::write(
+        www.join(".htaccess"),
+        b"RewriteEngine On\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteCond %{REQUEST_FILENAME} !-d\nRewriteRule ^ app.php [L]\n",
+    )
+    .unwrap();
+
+    let http_port = hostig_ports::suggest(8091, hostig_ports::ranges::HTTP.clone()).unwrap();
+    let stack = make_stack(tmp.path());
+    let http = start_stack(&stack, http_port, free_port());
+
+    let (code, body) = http_body(http, "/ruta/amiga/");
+    assert_eq!(code, 200, "body={body}");
+    assert!(
+        body.contains("APP:/ruta/amiga/"),
+        "debe ejecutar app.php: {body}"
+    );
+
+    stop_stack(&stack);
+}
+
+#[test]
+fn health_usa_usuario_dedicado_no_root() {
+    if skip_unless_windows() {
+        return;
+    }
+    allow_job_for_tests();
+    let tmp = data_dir();
+    ensure_stack_runtimes(tmp.path());
+    persist_runtime_cache(tmp.path());
+
+    let http_port = hostig_ports::suggest(8087, hostig_ports::ranges::HTTP.clone()).unwrap();
+    let stack = make_stack(tmp.path());
+    let _ = start_stack(&stack, http_port, free_port());
+
+    let health = std::fs::read_to_string(
+        tmp.path()
+            .join("apache")
+            .join("apache-default")
+            .join("hostig")
+            .join("health.php"),
+    )
+    .expect("health.php");
+    assert!(
+        health.contains("hostig_health"),
+        "debe usar hostig_health: {health}"
+    );
+    assert!(!health.contains("'root'"), "no debe embeber root: {health}");
+    assert!(
+        tmp.path()
+            .join("instances")
+            .join("mariadb-11.4")
+            .join("health.password")
+            .is_file(),
+        "debe existir health.password"
+    );
+
+    stop_stack(&stack);
 }

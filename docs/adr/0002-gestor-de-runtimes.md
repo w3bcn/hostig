@@ -29,6 +29,8 @@ Un módulo `runtimes` descarga, verifica y guarda. El supervisor y la UI depende
 
 El hash mínimo aceptado en el catálogo es SHA-256. Si el publicador solo ofrece SHA-1, una persona calcula el SHA-256 del archivo, lo comprueba contra el SHA-1 publicado y fija el SHA-256 en el catálogo.
 
+Si un archivo del catálogo cambia de hash con el **mismo nombre** (misma URL o mismo `filename`), **nunca** se acepta el nuevo hash sin contrastarlo de nuevo con el publicador (checksum o firma PGP publicados). Recalcular el SHA-256 solo sobre lo descargado, sin esa contraste, contradice este ADR: un atacante o un espejo alterado podría sustituir el binario y el catálogo «validaría» el hash malicioso.
+
 La descarga llega a un temporal. Se calcula el hash. Si no coincide, se borra el temporal y se registra el error con la acción «volver a descargar o revisar el catálogo». Solo entonces se descomprime en un directorio nuevo y se renombra a la ruta final.
 
 ### Vigilancia del catálogo

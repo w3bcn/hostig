@@ -36,7 +36,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/hostig-stack-it-cache
-          key: stack-it-${{ hashFiles('catalog/runtimes.toml') }}-php-8.4.27-apache-2.4.69
+          key: stack-it-${{ hashFiles('catalog/runtimes.toml') }}-php-8.4.27-apache-2.4.70
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
@@ -79,7 +79,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        # ubuntu-24.04: webkit2gtk-4.1; ubuntu-latest (26+) cuelga o no resuelve el paquete.
+        os: [windows-latest, ubuntu-24.04, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -91,7 +92,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          # ayatana sustituye a libappindicator3 en Ubuntu 24+ (el viejo deja apt colgado).
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
       - name: check
         working-directory: apps/desktop/src-tauri
         run: cargo check

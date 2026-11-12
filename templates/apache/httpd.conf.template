@@ -19,10 +19,8 @@ LoadModule proxy_balancer_module modules/mod_proxy_balancer.so
 LoadModule slotmem_shm_module modules/mod_slotmem_shm.so
 LoadModule lbmethod_byrequests_module modules/mod_lbmethod_byrequests.so
 LoadModule rewrite_module modules/mod_rewrite.so
-LoadModule setenvif_module modules/mod_setenvif.so
 
 TypesConfig conf/mime.types
-AddType application/x-httpd-php .php
 
 LogFormat "%h %l %u %t \"%r\" %>s %b" common
 ErrorLog "{{ERROR_LOG}}"
@@ -31,11 +29,29 @@ CustomLog "{{ACCESS_LOG}}" common
 
 ProxyRequests Off
 ProxyPreserveHost On
+# php-cgi (no FPM): GENERIC evita el prefijo proxy:fcgi:// y el quirks de FPM.
+ProxyFCGIBackendType GENERIC
+# Windows + php-cgi: el worker fcgi://host:port/ + path absoluto produce
+# SCRIPT_FILENAME=//C:/ruta/x.php (una o más barras delante de la unidad).
+# Antes:  SCRIPT_FILENAME=//C:/ruta/x.php  (también /C:/… según el worker)
+# Después: SCRIPT_FILENAME=C:/ruta/x.php
+ProxyFCGISetEnvIf "reqenv('SCRIPT_FILENAME') =~ m#^/+([a-zA-Z]:/.*)$#" SCRIPT_FILENAME "$1"
+ProxyFCGISetEnvIf "reqenv('PATH_TRANSLATED') =~ m#^/+([a-zA-Z]:/.*)$#" PATH_TRANSLATED "$1"
 
 <Directory />
     AllowOverride none
     Require all denied
 </Directory>
+
+# Denegar .php con punto o espacio final (y mayúsculas): sin mod_rewrite,
+# para que un RewriteEngine On del .htaccess del usuario no lo anule.
+<FilesMatch "(?i)\.php[\. ]+$">
+    Require all denied
+</FilesMatch>
+# URI con espacio / %20 / punto final (Windows a menudo normaliza el path a .php).
+<LocationMatch "(?i)\.php(\.|%20| )(/|$)">
+    Require all denied
+</LocationMatch>
 
 DocumentRoot "{{DOCUMENT_ROOT}}"
 <Directory "{{DOCUMENT_ROOT}}">
@@ -43,35 +59,59 @@ DocumentRoot "{{DOCUMENT_ROOT}}"
     AllowOverride All
     Require all granted
     DirectoryIndex index.php index.html
+
+    # SetHandler + FilesMatch; (?i) cubre .PHP. Sin AddType, ProxyPassMatch ni router.
+    # Sin RewriteRule de Hostig: los .htaccess del usuario se comportan como en Apache.
+    <FilesMatch "(?i)\.php$">
+        <If "-f %{REQUEST_FILENAME}">
+            SetHandler "proxy:balancer://php/"
+        </If>
+    </FilesMatch>
 </Directory>
 
-# Router y health fuera del DocumentRoot del usuario (ADR 0003 / 0005).
+# Health fuera del DocumentRoot: Alias evita que un .htaccess de WordPress
+# (RewriteRule . /index.php) capture /__hostig/health bajo el DocumentRoot.
+Alias /__hostig/health "{{HEALTH_PHP}}"
 <Directory "{{HOSTIG_DIR}}">
     Options None
     AllowOverride None
     Require all granted
+    <Files "health.php">
+        SetHandler "proxy:balancer://php/"
+        ProxyFCGISetEnvIf "true" SCRIPT_FILENAME "{{HEALTH_PHP}}"
+    </Files>
 </Directory>
 
-# Pool: cada miembro es php-cgi -b; la ruta C|... apunta al router FastCGI.
-# ProxyFCGISetEnvIf fija SCRIPT_FILENAME (en Windows php-cgi rechaza "/C:/...").
 <Proxy "balancer://php">
 {{BALANCER_MEMBERS}}
     ProxySet lbmethod=byrequests
 </Proxy>
 
-ProxyFCGISetEnvIf "true" SCRIPT_FILENAME "{{ROUTER_PHP}}"
-ProxyPassMatch "^/(.*\.php(/.*)?)$" "balancer://php/"
-ProxyPassMatch "^/__hostig/health$" "balancer://php/"
-
 <VirtualHost 127.0.0.1:{{HTTP_PORT}}>
     DocumentRoot "{{DOCUMENT_ROOT}}"
+    ProxyFCGIBackendType GENERIC
+    ProxyFCGISetEnvIf "reqenv('SCRIPT_FILENAME') =~ m#^/+([a-zA-Z]:/.*)$#" SCRIPT_FILENAME "$1"
+    ProxyFCGISetEnvIf "reqenv('PATH_TRANSLATED') =~ m#^/+([a-zA-Z]:/.*)$#" PATH_TRANSLATED "$1"
+
     <Directory "{{DOCUMENT_ROOT}}">
         Options Indexes FollowSymLinks
         AllowOverride All
         Require all granted
         DirectoryIndex index.php index.html
+        <FilesMatch "(?i)\.php$">
+            <If "-f %{REQUEST_FILENAME}">
+                SetHandler "proxy:balancer://php/"
+            </If>
+        </FilesMatch>
     </Directory>
-    ProxyFCGISetEnvIf "true" SCRIPT_FILENAME "{{ROUTER_PHP}}"
-    ProxyPassMatch "^/(.*\.php(/.*)?)$" "balancer://php/"
-    ProxyPassMatch "^/__hostig/health$" "balancer://php/"
+    Alias /__hostig/health "{{HEALTH_PHP}}"
+    <Directory "{{HOSTIG_DIR}}">
+        Options None
+        AllowOverride None
+        Require all granted
+        <Files "health.php">
+            SetHandler "proxy:balancer://php/"
+            ProxyFCGISetEnvIf "true" SCRIPT_FILENAME "{{HEALTH_PHP}}"
+        </Files>
+    </Directory>
 </VirtualHost>
