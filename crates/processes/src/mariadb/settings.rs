@@ -35,6 +35,12 @@ pub struct MariadbSettings {
     pub backoff_window_secs: u64,
     #[serde(default = "default_max_restarts")]
     pub max_restarts: u32,
+    /// Copias correctas a conservar por esquema (ADR 0007).
+    #[serde(default = "default_backup_retention")]
+    pub backup_retention: u64,
+    /// Edad máxima de la última copia correcta antes de forzar volcado (ADR 0007).
+    #[serde(default = "default_backup_max_age")]
+    pub backup_max_age_secs: u64,
 }
 
 fn default_hang() -> u64 {
@@ -58,6 +64,12 @@ fn default_backoff_window() -> u64 {
 fn default_max_restarts() -> u32 {
     DEFAULT_MAX_RESTARTS
 }
+fn default_backup_retention() -> u64 {
+    hostig_backup::DEFAULT_BACKUP_RETENTION as u64
+}
+fn default_backup_max_age() -> u64 {
+    hostig_backup::DEFAULT_BACKUP_MAX_AGE_SECS
+}
 
 impl Default for MariadbSettings {
     fn default() -> Self {
@@ -69,6 +81,8 @@ impl Default for MariadbSettings {
             backoff_secs: DEFAULT_BACKOFF_SECS.to_vec(),
             backoff_window_secs: DEFAULT_BACKOFF_WINDOW_SECS,
             max_restarts: DEFAULT_MAX_RESTARTS,
+            backup_retention: hostig_backup::DEFAULT_BACKUP_RETENTION as u64,
+            backup_max_age_secs: hostig_backup::DEFAULT_BACKUP_MAX_AGE_SECS,
         }
     }
 }

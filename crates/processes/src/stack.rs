@@ -161,6 +161,13 @@ impl StackService {
     }
 
     pub fn stop_async(self: &Arc<Self>) -> Result<StackJobStatus> {
+        self.stop_async_with(crate::mariadb::StopOptions::default())
+    }
+
+    pub fn stop_async_with(
+        self: &Arc<Self>,
+        db_options: crate::mariadb::StopOptions,
+    ) -> Result<StackJobStatus> {
         let job_id = Uuid::new_v4().to_string();
         let job = StackJobStatus {
             job_id: job_id.clone(),
@@ -175,7 +182,7 @@ impl StackService {
             .insert(job_id.clone(), job.clone());
         let service = Arc::clone(self);
         thread::spawn(move || {
-            let result = service.run_stop();
+            let result = service.run_stop(db_options);
             service.finish_job(&job_id, result);
         });
         self.job(&job.job_id)
@@ -279,8 +286,8 @@ impl StackService {
         Ok(())
     }
 
-    fn run_stop(&self) -> Result<()> {
-        // Orden inverso: Apache → PHP → MariaDB.
+    fn run_stop(&self, db_options: crate::mariadb::StopOptions) -> Result<()> {
+        // Orden inverso: Apache → PHP → MariaDB (volcado con writers quietos).
         if !matches!(
             self.apache.status().state,
             ApacheState::Stopped | ApacheState::Failed
@@ -296,7 +303,7 @@ impl StackService {
             wait_php_job(&self.php, &job.job_id, Duration::from_secs(60))?;
         }
         if !matches!(self.db.status().state, DbState::Stopped | DbState::Failed) {
-            let job = self.db.stop_async()?;
+            let job = self.db.stop_async_with(db_options)?;
             wait_db_job(&self.db, &job.job_id, Duration::from_secs(60))?;
         }
         Ok(())

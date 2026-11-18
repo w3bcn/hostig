@@ -16,6 +16,7 @@ pub use job::{
     allow_job_without_breakaway, current_job_spawn_policy, decide_after_breakaway_denied,
     BreakawayFallback, JobSpawnPolicy, ALLOW_JOB_WITHOUT_BREAKAWAY_ENV,
 };
+pub use os::process_creation_time;
 pub use registry::{try_adopt, AdoptOutcome, ProcessRecord};
 #[cfg(windows)]
 pub use spawn::spawn_detached_windows;

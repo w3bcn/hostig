@@ -3,6 +3,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
+use hostig_backup::WITHOUT_BACKUP_CONFIRM;
 use hostig_ipc::{process_is_running, Client, ClientError, Layout};
 use serde_json::{json, Value};
 
@@ -31,7 +32,11 @@ enum Commands {
         php_fcgi_max_requests: Option<u32>,
     },
     /// Para Apache, PHP y MariaDB (apagado ordenado).
-    Stop,
+    Stop {
+        /// Omite el volcado (exige confirmación escrita SIN-COPIA).
+        #[arg(long)]
+        without_backup: bool,
+    },
     /// Estado de MariaDB, PHP y Apache (puertos y PIDs).
     Status,
     /// Arranca o detiene el proceso hostig-supervisor.
@@ -101,8 +106,14 @@ enum DbCommand {
         #[arg(long)]
         version: Option<String>,
     },
-    /// Apagado ordenado con mariadb-admin shutdown.
-    Stop,
+    /// Apagado ordenado con mariadb-admin shutdown (y volcado si procede).
+    Stop {
+        /// Omite el volcado (exige confirmación escrita SIN-COPIA).
+        #[arg(long)]
+        without_backup: bool,
+    },
+    /// Lista copias locales por esquema (fecha y tamaño).
+    Backups,
     /// Estado de la instancia (pid, puerto, estado).
     Status,
     /// Emergencia: mata solo el PID registrado si coincide la hora de creación.
@@ -134,7 +145,7 @@ fn main() {
             php_pool_size,
             php_fcgi_max_requests,
         } => stack_start(http_port, db_port, php_pool_size, php_fcgi_max_requests),
-        Commands::Stop => stack_stop(),
+        Commands::Stop { without_backup } => stack_stop(without_backup),
         Commands::Status => stack_status(),
         Commands::Supervisor { action } => match action {
             SupervisorCommand::Start => supervisor_start(),
@@ -152,7 +163,8 @@ fn main() {
         },
         Commands::Db { action } => match action {
             DbCommand::Start { port, version } => db_start(port, version.as_deref()),
-            DbCommand::Stop => db_stop(),
+            DbCommand::Stop { without_backup } => db_stop(without_backup),
+            DbCommand::Backups => db_backups(),
             DbCommand::Status => db_status(),
             DbCommand::Kill { pid } => db_kill(pid),
             DbCommand::Quarantine { action } => match action {
@@ -210,12 +222,40 @@ fn stack_start(
     poll_stack_job(&layout, &started, Duration::from_secs(60 * 10))
 }
 
-fn stack_stop() -> i32 {
+fn confirm_without_backup() -> bool {
+    eprintln!(
+        "Vas a parar sin volcado de MariaDB. Escribe {WITHOUT_BACKUP_CONFIRM} para confirmar:"
+    );
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    line.trim() == WITHOUT_BACKUP_CONFIRM
+}
+
+fn stop_params(without_backup: bool) -> Option<Value> {
+    if !without_backup {
+        return Some(json!({}));
+    }
+    if !confirm_without_backup() {
+        eprintln!("confirmación incorrecta; no se para");
+        return None;
+    }
+    Some(json!({
+        "without_backup": true,
+        "confirm": WITHOUT_BACKUP_CONFIRM,
+    }))
+}
+
+fn stack_stop(without_backup: bool) -> i32 {
     let layout = match Layout::from_env() {
         Ok(layout) => layout,
         Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),
     };
-    let started = match Client::call(&layout, "stack.stop", json!({})) {
+    let Some(params) = stop_params(without_backup) else {
+        return 2;
+    };
+    let started = match Client::call(&layout, "stack.stop", params) {
         Ok(value) => value,
         Err(error) => return fail_client(error),
     };
@@ -627,16 +667,43 @@ fn db_start(port: Option<u16>, version: Option<&str>) -> i32 {
     poll_db_job(&layout, &started, Duration::from_secs(60 * 5))
 }
 
-fn db_stop() -> i32 {
+fn db_stop(without_backup: bool) -> i32 {
     let layout = match Layout::from_env() {
         Ok(layout) => layout,
         Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),
     };
-    let started = match Client::call(&layout, "db.stop", json!({})) {
+    let Some(params) = stop_params(without_backup) else {
+        return 2;
+    };
+    let started = match Client::call(&layout, "db.stop", params) {
         Ok(result) => result,
         Err(error) => return fail_client(error),
     };
-    poll_db_job(&layout, &started, Duration::from_secs(60))
+    poll_db_job(&layout, &started, Duration::from_secs(120))
+}
+
+fn db_backups() -> i32 {
+    let layout = match Layout::from_env() {
+        Ok(layout) => layout,
+        Err(error) => return fail(&error.to_string(), "revisa HOSTIG_DATA_DIR"),
+    };
+    match Client::call(&layout, "db.backups", json!({})) {
+        Ok(result) => {
+            if let Some(rows) = result.get("backups").and_then(Value::as_array) {
+                for row in rows {
+                    let schema = row.get("schema").and_then(Value::as_str).unwrap_or("?");
+                    let created = row.get("created_unix").and_then(Value::as_u64).unwrap_or(0);
+                    let size = row.get("size_bytes").and_then(Value::as_u64).unwrap_or(0);
+                    let path = row.get("path").and_then(Value::as_str).unwrap_or("");
+                    println!("{schema}\t{created}\t{size}\t{path}");
+                }
+            } else {
+                println!("{result}");
+            }
+            0
+        }
+        Err(error) => fail_client(error),
+    }
 }
 
 fn db_status() -> i32 {

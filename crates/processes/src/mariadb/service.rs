@@ -95,6 +95,15 @@ pub struct StartRequest {
     pub port: u16,
 }
 
+/// Opciones de apagado (ADR 0007 / 0011).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StopOptions {
+    /// Omite el volcado; el llamador debe haber exigido confirmación escrita.
+    pub without_backup: bool,
+    /// Apagado del sistema / cierre de sesión: sin volcado (ADR 0011).
+    pub system_shutdown: bool,
+}
+
 impl Default for StartRequest {
     fn default() -> Self {
         Self {
@@ -716,6 +725,10 @@ impl DbService {
     }
 
     pub fn stop_async(self: &Arc<Self>) -> Result<DbJobStatus> {
+        self.stop_async_with(StopOptions::default())
+    }
+
+    pub fn stop_async_with(self: &Arc<Self>, options: StopOptions) -> Result<DbJobStatus> {
         let job_id = Uuid::new_v4().to_string();
         let (id, port, pid, running_status) = {
             let mut inner = self.inner.lock().expect("db inner");
@@ -736,8 +749,7 @@ impl DbService {
                     error: None,
                 });
             }
-            inner.stop_requested = true;
-            inner.status.state = DbState::Stopping;
+            // El estado Stopping se marca tras el volcado (si hace falta).
             let status = DbJobStatus {
                 job_id: job_id.clone(),
                 state: "running".into(),
@@ -759,7 +771,7 @@ impl DbService {
         let job_id_thread = job_id.clone();
         let id_thread = id.clone();
         thread::spawn(move || {
-            let outcome = service.run_stop(&id_thread, port, pid);
+            let outcome = service.run_stop(&id_thread, port, pid, options);
             let mut inner = service.inner.lock().expect("db inner");
             if let Some(job) = inner.jobs.get_mut(&job_id_thread) {
                 match &outcome {
@@ -779,8 +791,15 @@ impl DbService {
                     Err(error) => {
                         job.state = "failed".into();
                         job.error = Some(error.into());
-                        inner.status.state = DbState::Failed;
-                        inner.status.error = Some(error.to_string());
+                        // Volcado fallido: la base sigue en marcha (ADR 0007).
+                        if matches!(inner.status.state, DbState::Stopping) {
+                            inner.status.state = DbState::Failed;
+                            inner.status.error = Some(error.to_string());
+                        } else {
+                            // Aún Running: el stop ni siquiera empezó el shutdown.
+                            inner.status.error = Some(error.to_string());
+                            inner.stop_requested = false;
+                        }
                     }
                 }
             }
@@ -789,10 +808,25 @@ impl DbService {
         Ok(running_status)
     }
 
-    fn run_stop(&self, id: &str, port: u16, pid: Option<u32>) -> Result<()> {
+    fn run_stop(&self, id: &str, port: u16, pid: Option<u32>, options: StopOptions) -> Result<()> {
         let paths = InstancePaths::new(&self.data_dir, id);
-        let log_offset = new_log_offset(&paths.error_log)?;
         let version = { self.inner.lock().expect("db inner").status.version.clone() };
+
+        if options.without_backup || options.system_shutdown {
+            // ADR 0007 / 0011: cierre sin copia (confirmado o apagado del sistema).
+        } else if std::env::var(TEST_DB_PROBE_ENV).ok().as_deref() == Some("tcp") {
+            // Tests con fake-mariadbd: no hay mariadb-dump real.
+        } else {
+            self.run_backup_before_stop(id, port, &version)?;
+        }
+
+        {
+            let mut inner = self.inner.lock().expect("db inner");
+            inner.stop_requested = true;
+            inner.status.state = DbState::Stopping;
+        }
+
+        let log_offset = new_log_offset(&paths.error_log)?;
         let _ = admin_shutdown(&paths, port, &version, &self.data_dir);
 
         let deadline = Instant::now() + STOP_TIMEOUT;
@@ -844,6 +878,36 @@ impl DbService {
             let _ = child.kill();
             let _ = child.wait();
         }
+        Ok(())
+    }
+
+    /// Lista copias correctas de la instancia por defecto.
+    pub fn list_backups(&self) -> Result<Vec<hostig_backup::BackupEntry>> {
+        let id = { self.inner.lock().expect("db inner").status.id.clone() };
+        hostig_backup::list_backups(&self.data_dir, &id).map_err(backup_to_process)
+    }
+
+    fn run_backup_before_stop(&self, id: &str, port: u16, version: &str) -> Result<()> {
+        let paths = InstancePaths::new(&self.data_dir, id);
+        let bin = mariadb_bin_for_version(&self.data_dir, version)?;
+        let settings = hostig_backup::BackupSettings {
+            retention: self.settings.backup_retention.max(1) as usize,
+            max_age_secs: self.settings.backup_max_age_secs.max(1),
+        };
+        let boot_id_unix = {
+            let inner = self.inner.lock().expect("db inner");
+            inner.status.pid.and_then(crate::os::process_creation_time)
+        };
+        let ctx = hostig_backup::DumpContext {
+            data_dir: self.data_dir.clone(),
+            instance_id: id.to_string(),
+            admin_cnf: paths.admin_cnf.clone(),
+            port,
+            bin_dir: bin,
+            settings,
+            boot_id_unix,
+        };
+        hostig_backup::ensure_backups_before_stop(&ctx).map_err(backup_to_process)?;
         Ok(())
     }
 
@@ -1150,6 +1214,10 @@ fn probe_ready(paths: &InstancePaths, port: u16, version: &str) -> Result<bool> 
         return Ok(TcpStream::connect(("127.0.0.1", port)).is_ok());
     }
     admin_ping(paths, port, version)
+}
+
+fn backup_to_process(error: hostig_backup::BackupError) -> ProcessError {
+    ProcessError::new(error.message, error.cause, error.action)
 }
 
 fn mariadb_bin_for_version(data_dir: &Path, version: &str) -> Result<PathBuf> {
