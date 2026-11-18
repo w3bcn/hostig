@@ -1,13 +1,17 @@
 use std::path::PathBuf;
 
-use windows::core::PWSTR;
+use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Console::{
     AttachConsole, FreeConsole, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler, CTRL_BREAK_EVENT,
 };
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    GetProcessTimes, OpenEventW, OpenProcess, QueryFullProcessImageNameW, SetEvent,
+    TerminateProcess, EVENT_MODIFY_STATE, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_TERMINATE,
 };
 
 use crate::error::{ProcessError, Result};
@@ -70,6 +74,58 @@ pub fn terminate_process(pid: u32) -> Result<()> {
         })?;
     }
     Ok(())
+}
+
+/// Activa el evento `ap{pid}_shutdown` de mpm_winnt (ADR 0003).
+pub fn signal_apache_shutdown_event(pid: u32) -> Result<()> {
+    let name = format!("ap{pid}_shutdown");
+    let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let handle =
+            OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(wide.as_ptr())).map_err(|error| {
+                ProcessError::new(
+                    "no se pudo abrir el evento de apagado de Apache",
+                    format!("{name}: {error}"),
+                    "se usará TerminateProcess del PID registrado como respaldo",
+                )
+            })?;
+        let result = SetEvent(handle);
+        let _ = CloseHandle(handle);
+        result.map_err(|error| {
+            ProcessError::new(
+                "no se pudo activar el evento de apagado de Apache",
+                format!("{name}: {error}"),
+                "se usará TerminateProcess del PID registrado como respaldo",
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// PIDs cuyo proceso padre es `parent_pid` (Toolhelp).
+pub fn child_pids(parent_pid: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return out;
+        };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        if Process32FirstW(snap, &mut entry).is_ok() {
+            loop {
+                if entry.th32ParentProcessID == parent_pid {
+                    out.push(entry.th32ProcessID);
+                }
+                if Process32NextW(snap, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+    }
+    out
 }
 
 /// Envía `CTRL_BREAK_EVENT` al grupo de proceso (PID del líder con

@@ -153,7 +153,7 @@ mod tests {
     fn el_catalogo_embebido_parsea_y_valida() {
         let catalog = Catalog::embedded().unwrap();
         assert!(catalog.entries.len() >= 3);
-        let apache = catalog.find("apache", "2.4.69").unwrap();
+        let apache = catalog.find("apache", "2.4.70").unwrap();
         assert_eq!(apache.normalized_sha256().len(), 64);
         assert!(!apache.urls.is_empty());
         assert!(catalog.find("php", "8.4.27").is_some());

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_APACHE_VERSION: &str = "2.4.69";
+pub const DEFAULT_APACHE_VERSION: &str = "2.4.70";
 pub const DEFAULT_HTTP_PORT: u16 = 8080;
 pub const DEFAULT_BACKOFF_SECS: [u64; 5] = [1, 2, 4, 8, 16];
 pub const DEFAULT_BACKOFF_WINDOW_SECS: u64 = 600;
