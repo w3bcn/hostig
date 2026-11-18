@@ -12,4 +12,9 @@ pub use service::{
     health_ok, ApacheJobStatus, ApacheService, ApacheStartRequest, ApacheState, ApacheStatus,
     TEST_HTTPD_ENV, WINDOWS_SHUTDOWN_METHOD,
 };
+
+/// PIDs hijos directos (para IT de apagado: no debe quedar worker httpd).
+pub fn child_pids(parent_pid: u32) -> Vec<u32> {
+    crate::os::child_pids(parent_pid)
+}
 pub use settings::{ApacheSettings, DEFAULT_APACHE_VERSION, DEFAULT_HTTP_PORT};

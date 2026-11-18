@@ -19,6 +19,8 @@ pub struct InstancePaths {
     pub pid_file: PathBuf,
     pub admin_cnf: PathBuf,
     pub password_file: PathBuf,
+    /// Contraseña de `hostig_health` (solo USAGE); ACL de usuario.
+    pub health_password_file: PathBuf,
 }
 
 impl InstancePaths {
@@ -32,6 +34,7 @@ impl InstancePaths {
             pid_file: root.join("mysql.pid"),
             admin_cnf: root.join("admin.cnf"),
             password_file: root.join("admin.password"),
+            health_password_file: root.join("health.password"),
             root,
         }
     }
