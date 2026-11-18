@@ -1,12 +1,32 @@
-/// La fase 0 no copia bases. El módulo existe para que el resto no dependa de sus internos.
+//! Volcados lógicos de MariaDB antes de parar (ADR 0007).
+
+mod dump;
+mod error;
+mod meta;
+mod space;
+
+pub use dump::{
+    ensure_backups_before_stop, list_backups, list_user_schemas, BackupEntry, DumpContext,
+};
+pub use error::{BackupError, Result};
+pub use meta::{
+    backup_dir, latest_good_meta, load_meta, meta_path_for, needs_dump, BackupMeta, BackupSettings,
+    ServerSnapshot, DEFAULT_BACKUP_MAX_AGE_SECS, DEFAULT_BACKUP_RETENTION, SYSTEM_SCHEMAS,
+    WRITE_COM_VARS,
+};
+
+/// El módulo de copias está implementado (fase 1 bloque 5).
 pub fn implemented() -> bool {
-    false
+    true
 }
+
+/// Frase de confirmación exigida por `stop --without-backup`.
+pub const WITHOUT_BACKUP_CONFIRM: &str = "SIN-COPIA";
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn fase_0_aun_no_implementa_el_modulo() {
-        assert!(!super::implemented());
+    fn modulo_implementado() {
+        assert!(super::implemented());
     }
 }
