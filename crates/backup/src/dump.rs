@@ -13,7 +13,7 @@ use flate2::Compression;
 use crate::error::{BackupError, Result};
 use crate::meta::{
     backup_dir, latest_good_meta, meta_path_for, needs_dump, now_unix, save_meta, BackupMeta,
-    BackupSettings, ServerSnapshot, SYSTEM_SCHEMAS, WRITE_COM_VARS,
+    BackupSettings, ServerSnapshot, SYSTEM_SCHEMAS,
 };
 use crate::space;
 
@@ -140,8 +140,8 @@ fn parse_status_map(text: &str) -> std::collections::BTreeMap<String, u64> {
 /// Instantánea de arranque + Com_* + motores no InnoDB.
 pub fn collect_server_snapshot(ctx: &DumpContext) -> Result<ServerSnapshot> {
     let mut names = vec!["Uptime".to_string()];
-    for v in WRITE_COM_VARS {
-        names.push((*v).to_string());
+    for v in crate::meta::write_status_vars() {
+        names.push(v.to_string());
     }
     let in_list = names
         .iter()
@@ -157,9 +157,13 @@ pub fn collect_server_snapshot(ctx: &DumpContext) -> Result<ServerSnapshot> {
         .boot_id_unix
         .unwrap_or_else(|| now.saturating_sub(uptime));
 
+    // Solo contadores que esa versión expone; ausentes no se inventan a 0
+    // (si desaparecen respecto a la copia previa, needs_dump vuelca por duda).
     let mut com_counters = std::collections::BTreeMap::new();
-    for v in WRITE_COM_VARS {
-        com_counters.insert((*v).to_string(), status.get(*v).copied().unwrap_or(0));
+    for v in crate::meta::write_status_vars() {
+        if let Some(n) = status.get(v).copied() {
+            com_counters.insert(v.to_string(), n);
+        }
     }
 
     let excluded = SYSTEM_SCHEMAS

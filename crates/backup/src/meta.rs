@@ -15,17 +15,60 @@ pub const DEFAULT_BACKUP_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 pub const SYSTEM_SCHEMAS: &[&str] = &["mysql", "sys", "information_schema", "performance_schema"];
 
 /// Contadores Com_* de escritura y DDL usados para detectar cambios.
+/// Ante la duda se vuelca (ADR 0007); se incluyen variantes multi-fila/DDL
+/// y las que esa versión de MariaDB exponga en `SHOW GLOBAL STATUS`.
 pub const WRITE_COM_VARS: &[&str] = &[
     "Com_insert",
+    "Com_insert_select",
     "Com_update",
+    "Com_update_multi",
     "Com_delete",
+    "Com_delete_multi",
     "Com_replace",
+    "Com_replace_select",
+    "Com_load",
     "Com_create_table",
     "Com_alter_table",
     "Com_drop_table",
     "Com_truncate",
     "Com_rename_table",
+    "Com_create_index",
+    "Com_drop_index",
+    "Com_create_db",
+    "Com_drop_db",
+    "Com_alter_db",
+    "Com_create_view",
+    "Com_drop_view",
+    "Com_create_procedure",
+    "Com_drop_procedure",
+    "Com_create_function",
+    "Com_drop_function",
+    "Com_create_trigger",
+    "Com_drop_trigger",
+    "Com_create_event",
+    "Com_alter_event",
+    "Com_drop_event",
 ];
+
+/// Red de seguridad: operaciones a nivel de handler (pueden ver caminos
+/// que no incrementan un Com_* concreto).
+pub const HANDLER_WRITE_VARS: &[&str] = &["Handler_write", "Handler_update", "Handler_delete"];
+
+/// Margen al comparar `boot_id` derivado de `ahora − Uptime` (ADR 0007).
+pub const BOOT_ID_TOLERANCE_SECS: u64 = 2;
+
+/// Todos los contadores de estado usados para decidir si hace falta volcar.
+pub fn write_status_vars() -> impl Iterator<Item = &'static str> {
+    WRITE_COM_VARS
+        .iter()
+        .chain(HANDLER_WRITE_VARS.iter())
+        .copied()
+}
+
+fn boot_id_changed(current: u64, previous: u64) -> bool {
+    let diff = current.abs_diff(previous);
+    diff > BOOT_ID_TOLERANCE_SECS
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackupSettings {
@@ -165,20 +208,20 @@ pub fn needs_dump(
     if now_unix.saturating_sub(prev.created_unix) > settings.max_age_secs {
         return true;
     }
-    if snap.boot_id_unix != prev.boot_id_unix {
+    if boot_id_changed(snap.boot_id_unix, prev.boot_id_unix) {
         return true;
     }
     if snap.has_non_innodb {
         return true;
     }
-    for key in WRITE_COM_VARS {
-        let cur = snap.com_counters.get(*key).copied().unwrap_or(0);
-        let old = prev.com_counters.get(*key).copied().unwrap_or(0);
+    for key in write_status_vars() {
+        let cur = snap.com_counters.get(key).copied().unwrap_or(0);
+        let old = prev.com_counters.get(key).copied().unwrap_or(0);
         if cur > old {
             return true;
         }
         // Contador ausente ahora pero presente antes: duda → volcar.
-        if prev.com_counters.contains_key(*key) && !snap.com_counters.contains_key(*key) {
+        if prev.com_counters.contains_key(key) && !snap.com_counters.contains_key(key) {
             return true;
         }
     }
@@ -199,8 +242,8 @@ mod tests {
     fn snap(boot: u64, insert: u64, non_innodb: bool) -> ServerSnapshot {
         let mut com = BTreeMap::new();
         com.insert("Com_insert".into(), insert);
-        for k in WRITE_COM_VARS {
-            com.entry((*k).to_string()).or_insert(0);
+        for k in write_status_vars() {
+            com.entry(k.to_string()).or_insert(0);
         }
         ServerSnapshot {
             boot_id_unix: boot,
@@ -242,10 +285,65 @@ mod tests {
     }
 
     #[test]
+    fn insert_select_vuelca() {
+        let prev_snap = snap(100, 5, false);
+        let prev = BackupMeta::from_snapshot("app", &prev_snap, 150);
+        let mut cur = snap(100, 5, false);
+        cur.com_counters.insert("Com_insert_select".into(), 1);
+        assert!(needs_dump(
+            Some(&cur),
+            Some(&prev),
+            &BackupSettings::default(),
+            200
+        ));
+    }
+
+    #[test]
+    fn handler_write_vuelca() {
+        let prev_snap = snap(100, 5, false);
+        let prev = BackupMeta::from_snapshot("app", &prev_snap, 150);
+        let mut cur = snap(100, 5, false);
+        cur.com_counters.insert("Handler_write".into(), 3);
+        assert!(needs_dump(
+            Some(&cur),
+            Some(&prev),
+            &BackupSettings::default(),
+            200
+        ));
+    }
+
+    #[test]
     fn reinicio_vuelca() {
         let prev_snap = snap(100, 5, false);
         let prev = BackupMeta::from_snapshot("app", &prev_snap, 150);
         let cur = snap(180, 0, false);
+        assert!(needs_dump(
+            Some(&cur),
+            Some(&prev),
+            &BackupSettings::default(),
+            200
+        ));
+    }
+
+    #[test]
+    fn reinicio_con_diferencia_de_un_segundo_no_vuelca() {
+        let prev_snap = snap(100, 5, false);
+        let prev = BackupMeta::from_snapshot("app", &prev_snap, 150);
+        // ahora−Uptime puede variar ±1 s entre mediciones: no es reinicio.
+        let cur = snap(101, 5, false);
+        assert!(!needs_dump(
+            Some(&cur),
+            Some(&prev),
+            &BackupSettings::default(),
+            200
+        ));
+    }
+
+    #[test]
+    fn reinicio_con_diferencia_de_tres_segundos_vuelca() {
+        let prev_snap = snap(100, 5, false);
+        let prev = BackupMeta::from_snapshot("app", &prev_snap, 150);
+        let cur = snap(103, 5, false);
         assert!(needs_dump(
             Some(&cur),
             Some(&prev),

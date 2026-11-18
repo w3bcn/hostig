@@ -10,8 +10,9 @@ pub use dump::{
 };
 pub use error::{BackupError, Result};
 pub use meta::{
-    backup_dir, latest_good_meta, load_meta, meta_path_for, needs_dump, BackupMeta, BackupSettings,
-    ServerSnapshot, DEFAULT_BACKUP_MAX_AGE_SECS, DEFAULT_BACKUP_RETENTION, SYSTEM_SCHEMAS,
+    backup_dir, latest_good_meta, load_meta, meta_path_for, needs_dump, write_status_vars,
+    BackupMeta, BackupSettings, ServerSnapshot, BOOT_ID_TOLERANCE_SECS,
+    DEFAULT_BACKUP_MAX_AGE_SECS, DEFAULT_BACKUP_RETENTION, HANDLER_WRITE_VARS, SYSTEM_SCHEMAS,
     WRITE_COM_VARS,
 };
 

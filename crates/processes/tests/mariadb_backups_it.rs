@@ -220,11 +220,16 @@ fn mariadb_client(data: &Path) -> PathBuf {
 }
 
 fn run_sql(data: &Path, port: u16, sql: &str) {
+    run_sql_with(data, port, sql, &[]);
+}
+
+fn run_sql_with(data: &Path, port: u16, sql: &str, extra_args: &[&str]) {
     let paths = InstancePaths::new(data, DEFAULT_INSTANCE_ID);
     let client = mariadb_client(data);
     let defaults = format!("--defaults-extra-file={}", paths.admin_cnf.display());
-    let output = Command::new(&client)
-        .arg(&defaults)
+    let mut cmd = Command::new(&client);
+    cmd.arg(&defaults)
+        .args(extra_args)
         .arg("--protocol=tcp")
         .arg("-h")
         .arg("127.0.0.1")
@@ -232,13 +237,13 @@ fn run_sql(data: &Path, port: u16, sql: &str) {
         .arg(port.to_string())
         .arg("-e")
         .arg(sql)
-        .stdin(Stdio::null())
-        .output()
-        .expect("mariadb client");
+        .stdin(Stdio::null());
+    let output = cmd.output().expect("mariadb client");
     assert!(
         output.status.success(),
-        "SQL falló: {}\n{}",
+        "SQL falló: {}\nstdout={}\nstderr={}",
         sql,
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -368,6 +373,65 @@ fn segundo_stop_sin_escrituras_no_crea_copia() {
         schema_backups(tmp.path(), "hostig_bak_b").len(),
         1,
         "sin escrituras y copia reciente no debe haber otra"
+    );
+
+    stop_db_without_backup(&service);
+}
+
+#[test]
+fn load_data_e_insert_select_provocan_copia_nueva() {
+    if skip_unless_windows() {
+        return;
+    }
+    allow_job_for_tests();
+    let tmp = data_dir();
+    ensure_mariadb_installed(tmp.path());
+    persist_runtime_cache(tmp.path());
+
+    let port = free_port();
+    let service = Arc::new(DbService::with_embedded(tmp.path()).expect("db"));
+    start_db(&service, port);
+    run_sql(
+        tmp.path(),
+        port,
+        "CREATE DATABASE hostig_bak_load; USE hostig_bak_load; \
+         CREATE TABLE src(id INT PRIMARY KEY, name VARCHAR(32)); \
+         CREATE TABLE dst(id INT PRIMARY KEY, name VARCHAR(32)); \
+         INSERT INTO src VALUES (1, 'base');",
+    );
+    let pid = service.status().pid;
+    hostig_backup::ensure_backups_before_stop(&dump_ctx(tmp.path(), port, pid))
+        .expect("copia inicial");
+    assert_eq!(schema_backups(tmp.path(), "hostig_bak_load").len(), 1);
+
+    // CSV pequeño + LOAD DATA LOCAL (Com_load / Handler_write).
+    let paths = InstancePaths::new(tmp.path(), DEFAULT_INSTANCE_ID);
+    let csv = paths.tmpdir.join("hostig_load.csv");
+    fs::write(&csv, "2,desde-csv\n").expect("csv");
+    let csv_sql = csv.to_string_lossy().replace('\\', "/");
+    run_sql(tmp.path(), port, "SET GLOBAL local_infile=1");
+    run_sql_with(
+        tmp.path(),
+        port,
+        &format!(
+            "USE hostig_bak_load; LOAD DATA LOCAL INFILE '{csv_sql}' INTO TABLE src \
+             FIELDS TERMINATED BY ',' LINES TERMINATED BY '\\n' (id, name);"
+        ),
+        &["--local-infile=1"],
+    );
+    // INSERT ... SELECT (Com_insert_select).
+    run_sql(
+        tmp.path(),
+        port,
+        "USE hostig_bak_load; INSERT INTO dst SELECT * FROM src;",
+    );
+
+    hostig_backup::ensure_backups_before_stop(&dump_ctx(tmp.path(), port, pid))
+        .expect("copia tras escrituras");
+    assert_eq!(
+        schema_backups(tmp.path(), "hostig_bak_load").len(),
+        2,
+        "LOAD DATA e INSERT ... SELECT con copia <24 h deben provocar copia nueva"
     );
 
     stop_db_without_backup(&service);
