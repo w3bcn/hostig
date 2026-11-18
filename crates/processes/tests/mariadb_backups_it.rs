@@ -275,6 +275,11 @@ fn deny_write(dir: &Path) {
     assert!(status.success(), "icacls deny falló");
 }
 
+#[cfg(not(windows))]
+fn deny_write(dir: &Path) {
+    let _ = dir;
+}
+
 #[cfg(windows)]
 fn allow_write(dir: &Path) {
     let user = std::env::var("USERNAME").unwrap_or_else(|_| "Everyone".into());
@@ -283,6 +288,11 @@ fn allow_write(dir: &Path) {
         .arg("/remove:d")
         .arg(&user)
         .status();
+}
+
+#[cfg(not(windows))]
+fn allow_write(dir: &Path) {
+    let _ = dir;
 }
 
 #[test]
