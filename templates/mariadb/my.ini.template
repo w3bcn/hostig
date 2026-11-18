@@ -6,6 +6,7 @@ port={{PORT}}
 bind-address=127.0.0.1
 datadir={{DATADIR}}
 basedir={{BASEDIR}}
+tmpdir={{TMPDIR}}
 log-error={{ERROR_LOG}}
 pid-file={{PID_FILE}}
 skip-name-resolve

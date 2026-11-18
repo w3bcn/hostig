@@ -287,11 +287,6 @@ fn dump_one_schema(ctx: &DumpContext, schema: &str, snap: &ServerSnapshot) -> Re
     }
     let _ = fs::remove_file(&probe);
 
-    let stamp = timestamp_name(SystemTime::now());
-    let final_path = dir.join(format!("{stamp}.sql.gz"));
-    let tmp_path = dir.join(format!("{stamp}.sql.gz.partial"));
-    let _ = fs::remove_file(&tmp_path);
-
     let needed = estimate_schema_bytes(ctx, schema)
         .saturating_mul(2)
         .max(1024 * 1024);
@@ -312,7 +307,74 @@ fn dump_one_schema(ctx: &DumpContext, schema: &str, snap: &ServerSnapshot) -> Re
         }
     }
 
-    let mut child = Command::new(&dump)
+    // TMP propio: en Windows, --routines/--events crean tablas temporales y
+    // fallan si varios mariadbd comparten %TEMP% (CI en paralelo).
+    let dump_tmp = ctx.data_dir.join("tmp").join("dump").join(&ctx.instance_id);
+    fs::create_dir_all(&dump_tmp)
+        .map_err(|error| disk_or_perm_error(&dump_tmp, needed, error, "crear TMP de volcado"))?;
+
+    let mut last_err = None;
+    for attempt in 1..=3u32 {
+        let stamp = timestamp_name(SystemTime::now());
+        let final_path = dir.join(format!("{stamp}.sql.gz"));
+        let tmp_path = dir.join(format!("{stamp}.sql.gz.partial"));
+        let _ = fs::remove_file(&tmp_path);
+        match run_mariadb_dump_once(ctx, &dump, schema, &tmp_path, &dump_tmp, needed, &dir) {
+            Ok(()) => match validate_dump_gz(&tmp_path) {
+                Ok(()) => {
+                    fs::rename(&tmp_path, &final_path).map_err(|error| {
+                        BackupError::new(
+                            "no se pudo fijar el volcado",
+                            error.to_string(),
+                            "revisa permisos en la carpeta de copias",
+                        )
+                    })?;
+                    let created = now_unix();
+                    let meta = BackupMeta::from_snapshot(schema, snap, created);
+                    let meta_path = meta_path_for(&final_path);
+                    if let Err(error) = save_meta(&meta_path, &meta) {
+                        let _ = fs::remove_file(&final_path);
+                        return Err(error);
+                    }
+                    apply_retention(&dir, ctx.settings.retention)?;
+                    return Ok(final_path);
+                }
+                Err(error) => {
+                    let _ = fs::remove_file(&tmp_path);
+                    last_err = Some(error);
+                }
+            },
+            Err(error) => {
+                let _ = fs::remove_file(&tmp_path);
+                last_err = Some(error);
+            }
+        }
+        if attempt < 3 {
+            std::thread::sleep(std::time::Duration::from_millis(400 * u64::from(attempt)));
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        BackupError::new(
+            "mariadb-dump falló",
+            "sin detalle",
+            format!(
+                "reintenta o usa hostig stop --without-backup (confirma con {})",
+                crate::WITHOUT_BACKUP_CONFIRM
+            ),
+        )
+    }))
+}
+
+fn run_mariadb_dump_once(
+    ctx: &DumpContext,
+    dump: &Path,
+    schema: &str,
+    tmp_path: &Path,
+    dump_tmp: &Path,
+    needed: u64,
+    dir: &Path,
+) -> Result<()> {
+    let mut child = Command::new(dump)
         .arg(defaults_extra_arg(&ctx.admin_cnf))
         .arg("--protocol=tcp")
         .arg("-h")
@@ -325,6 +387,9 @@ fn dump_one_schema(ctx: &DumpContext, schema: &str, snap: &ServerSnapshot) -> Re
         .arg("--triggers")
         .arg("--databases")
         .arg(schema)
+        .env("TMP", dump_tmp)
+        .env("TEMP", dump_tmp)
+        .env("TMPDIR", dump_tmp)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -345,8 +410,8 @@ fn dump_one_schema(ctx: &DumpContext, schema: &str, snap: &ServerSnapshot) -> Re
         )
     })?;
 
-    let out_file = File::create(&tmp_path)
-        .map_err(|error| disk_or_perm_error(&dir, needed, error, "crear fichero de volcado"))?;
+    let out_file = File::create(tmp_path)
+        .map_err(|error| disk_or_perm_error(dir, needed, error, "crear fichero de volcado"))?;
     let mut encoder = GzEncoder::new(out_file, Compression::default());
     let mut reader = BufReader::new(stdout);
     let mut buf = [0u8; 64 * 1024];
@@ -362,12 +427,12 @@ fn dump_one_schema(ctx: &DumpContext, schema: &str, snap: &ServerSnapshot) -> Re
             break;
         }
         encoder.write_all(&buf[..n]).map_err(|error| {
-            disk_or_perm_error(&dir, needed, error, "escribir volcado comprimido")
+            disk_or_perm_error(dir, needed, error, "escribir volcado comprimido")
         })?;
     }
     encoder
         .finish()
-        .map_err(|error| disk_or_perm_error(&dir, needed, error, "cerrar gzip del volcado"))?;
+        .map_err(|error| disk_or_perm_error(dir, needed, error, "cerrar gzip del volcado"))?;
 
     let output = child.wait_with_output().map_err(|error| {
         BackupError::new(
@@ -377,7 +442,6 @@ fn dump_one_schema(ctx: &DumpContext, schema: &str, snap: &ServerSnapshot) -> Re
         )
     })?;
     if !output.status.success() {
-        let _ = fs::remove_file(&tmp_path);
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(BackupError::new(
             "mariadb-dump falló",
@@ -388,30 +452,7 @@ fn dump_one_schema(ctx: &DumpContext, schema: &str, snap: &ServerSnapshot) -> Re
             ),
         ));
     }
-
-    if let Err(error) = validate_dump_gz(&tmp_path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(error);
-    }
-
-    fs::rename(&tmp_path, &final_path).map_err(|error| {
-        BackupError::new(
-            "no se pudo fijar el volcado",
-            error.to_string(),
-            "revisa permisos en la carpeta de copias",
-        )
-    })?;
-
-    let created = now_unix();
-    let meta = BackupMeta::from_snapshot(schema, snap, created);
-    let meta_path = meta_path_for(&final_path);
-    if let Err(error) = save_meta(&meta_path, &meta) {
-        let _ = fs::remove_file(&final_path);
-        return Err(error);
-    }
-
-    apply_retention(&dir, ctx.settings.retention)?;
-    Ok(final_path)
+    Ok(())
 }
 
 fn disk_or_perm_error(dir: &Path, needed: u64, error: std::io::Error, what: &str) -> BackupError {
