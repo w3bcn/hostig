@@ -274,11 +274,11 @@ impl StackService {
         if let Err(error) =
             wait_apache_job(&self.apache, &apache_job.job_id, Duration::from_secs(120))
         {
-            let _ = self.run_stop();
+            let _ = self.run_stop(crate::mariadb::StopOptions::default());
             return Err(error);
         }
         if self.apache.status().state != ApacheState::Running {
-            let _ = self.run_stop();
+            let _ = self.run_stop(crate::mariadb::StopOptions::default());
             return Err(ProcessError::new(
                 "Apache no quedó en marcha",
                 self.apache
