@@ -5,7 +5,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -84,7 +84,15 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn install_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("install lock")
+}
+
 fn ensure_runtime(data: &Path, component: &str, version: &str) {
+    let _guard = install_lock();
     let catalog = Catalog::embedded().expect("catálogo");
     let entry = catalog
         .find(component, version)
@@ -93,6 +101,10 @@ fn ensure_runtime(data: &Path, component: &str, version: &str) {
     let root = runtime_dir(data, &entry);
     if root.join(MANIFEST_NAME).is_file() {
         return;
+    }
+    // Destino a medias (carrera de tests en paralelo o caché rota).
+    if root.exists() {
+        let _ = std::fs::remove_dir_all(&root);
     }
     let service = RuntimeService::with_embedded(data).expect("runtimes");
     service
