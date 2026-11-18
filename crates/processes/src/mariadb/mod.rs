@@ -24,7 +24,7 @@ pub use quarantine::{
     list_quarantines, quarantine_detected, restore_quarantine, QuarantineManifest,
 };
 pub use service::{
-    DbJobStatus, DbService, DbState, DbStatus, StartRequest, DEFAULT_MARIADB_VERSION,
+    DbJobStatus, DbService, DbState, DbStatus, StartRequest, StopOptions, DEFAULT_MARIADB_VERSION,
     TEST_DB_PROBE_ENV, TEST_MARIADBD_ENV,
 };
 pub use settings::{GlobalManifest, MariadbSettings};

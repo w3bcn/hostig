@@ -11,6 +11,7 @@ name = "hostig_supervisor"
 path = "src/lib.rs"
 
 [dependencies]
+hostig-backup = { path = "../backup" }
 hostig-ipc = { path = "../ipc" }
 hostig-ports = { path = "../ports" }
 hostig-processes = { path = "../processes" }

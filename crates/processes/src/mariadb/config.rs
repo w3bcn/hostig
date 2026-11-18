@@ -15,6 +15,7 @@ pub struct InstancePaths {
     pub root: PathBuf,
     pub my_ini: PathBuf,
     pub datadir: PathBuf,
+    pub tmpdir: PathBuf,
     pub error_log: PathBuf,
     pub pid_file: PathBuf,
     pub admin_cnf: PathBuf,
@@ -30,6 +31,7 @@ impl InstancePaths {
             id: id.to_string(),
             my_ini: root.join("my.ini"),
             datadir: root.join("data"),
+            tmpdir: root.join("tmp"),
             error_log: root.join("logs").join("error.log"),
             pid_file: root.join("mysql.pid"),
             admin_cnf: root.join("admin.cnf"),
@@ -43,6 +45,7 @@ impl InstancePaths {
         fs::create_dir_all(&self.root)?;
         fs::create_dir_all(self.root.join("logs"))?;
         fs::create_dir_all(&self.datadir)?;
+        fs::create_dir_all(&self.tmpdir)?;
         Ok(())
     }
 }
@@ -53,6 +56,7 @@ pub fn generate_my_ini(paths: &InstancePaths, basedir: &Path, port: u16) -> Resu
         .replace("{{INSTANCE_ID}}", &paths.id)
         .replace("{{PORT}}", &port.to_string())
         .replace("{{DATADIR}}", &path_ini(paths.datadir.as_path()))
+        .replace("{{TMPDIR}}", &path_ini(paths.tmpdir.as_path()))
         .replace("{{BASEDIR}}", &path_ini(basedir))
         .replace("{{ERROR_LOG}}", &path_ini(paths.error_log.as_path()))
         .replace("{{PID_FILE}}", &path_ini(paths.pid_file.as_path()));

@@ -16,6 +16,7 @@ path = "src/bin/hostig-supervisor.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+hostig-backup = { path = "../../crates/backup" }
 hostig-ipc = { path = "../../crates/ipc" }
 hostig-processes = { path = "../../crates/processes" }
 hostig-supervisor = { path = "../../crates/supervisor" }

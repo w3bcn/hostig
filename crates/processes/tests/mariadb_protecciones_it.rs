@@ -54,6 +54,7 @@ fn short_settings() -> MariadbSettings {
         backoff_secs: vec![0, 0, 0, 0, 0],
         backoff_window_secs: 120,
         max_restarts: 5,
+        ..MariadbSettings::default()
     }
 }
 
@@ -313,6 +314,7 @@ fn muerte_inesperada_reinicia_con_backoff_y_sexta_queda_en_error() {
         backoff_secs: vec![0, 0, 0, 0, 0],
         backoff_window_secs: 120,
         max_restarts: 5,
+        ..MariadbSettings::default()
     };
     let service = service_with_fake(tmp.path(), settings);
     let port = free_port();

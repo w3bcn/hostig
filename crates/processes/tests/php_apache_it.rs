@@ -5,7 +5,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -83,6 +83,14 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    // Si un test panica con el lock, no envenenar al resto.
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn ensure_runtime(data: &Path, component: &str, version: &str) {
     let catalog = Catalog::embedded().expect("catálogo");
     let entry = catalog
@@ -93,10 +101,30 @@ fn ensure_runtime(data: &Path, component: &str, version: &str) {
     if root.join(MANIFEST_NAME).is_file() {
         return;
     }
+    // Destino a medias (carrera de tests en paralelo o caché rota).
+    if root.exists() {
+        let _ = std::fs::remove_dir_all(&root);
+    }
     let service = RuntimeService::with_embedded(data).expect("runtimes");
-    service
-        .install_blocking(component, version)
-        .unwrap_or_else(|e| panic!("instalar {component}@{version}: {e}"));
+    let mut last = None;
+    for attempt in 1..=3u32 {
+        match service.install_blocking(component, version) {
+            Ok(_) => return,
+            Err(error) => {
+                if root.exists() {
+                    let _ = std::fs::remove_dir_all(&root);
+                }
+                last = Some(error.to_string());
+                if attempt < 3 {
+                    thread::sleep(Duration::from_millis(500 * u64::from(attempt)));
+                }
+            }
+        }
+    }
+    panic!(
+        "instalar {component}@{version} tras reintentos: {}",
+        last.unwrap_or_default()
+    );
 }
 
 fn ensure_stack_runtimes(data: &Path) {
@@ -200,6 +228,7 @@ fn ciclo_completo_start_health_stop() {
     if skip_unless_windows() {
         return;
     }
+    let _guard = test_lock();
     allow_job_for_tests();
     let tmp = data_dir();
     ensure_stack_runtimes(tmp.path());
@@ -270,6 +299,7 @@ fn reciclado_fcgi_max_requests_no_cuenta_backoff() {
     if skip_unless_windows() {
         return;
     }
+    let _guard = test_lock();
     allow_job_for_tests();
     let tmp = data_dir();
     ensure_stack_runtimes(tmp.path());
@@ -318,6 +348,7 @@ fn muerte_php_cgi_reinicia_y_apache_sigue() {
     if skip_unless_windows() {
         return;
     }
+    let _guard = test_lock();
     allow_job_for_tests();
     let tmp = data_dir();
     ensure_stack_runtimes(tmp.path());

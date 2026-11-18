@@ -3,13 +3,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use hostig_backup::WITHOUT_BACKUP_CONFIRM;
 use hostig_ipc::{
     connect_raw, error_response, listen, load_or_create_token, protocol_success, read_frame,
     tokens_match, write_frame, ByteStream, FrameError, Layout, Listener, MAX_FRAME_LEN,
     PROTOCOL_VERSION,
 };
 use hostig_processes::apache::ApacheService;
-use hostig_processes::mariadb::{DbService, StartRequest, DEFAULT_MARIADB_VERSION};
+use hostig_processes::mariadb::{DbService, StartRequest, StopOptions, DEFAULT_MARIADB_VERSION};
 use hostig_processes::php::PhpService;
 use hostig_processes::{StackService, StackStartRequest};
 use hostig_runtimes::{clean_tmp_runtimes, RuntimeService};
@@ -323,12 +324,23 @@ fn session(
                 reply_error(&mut stream, id, -32030, &message, &cause, &action)?;
             }
         },
-        "db.stop" => match handle_db_stop(db, log) {
+        "db.stop" => match handle_db_stop(db, &request, log) {
             Ok(status) => {
                 write_frame(&mut stream, &protocol_success(id, json!(status)))?;
             }
             Err((message, cause, action)) => {
                 reply_error(&mut stream, id, -32031, &message, &cause, &action)?;
+            }
+        },
+        "db.backups" => match handle_db_backups(db, log) {
+            Ok(rows) => {
+                write_frame(
+                    &mut stream,
+                    &protocol_success(id, json!({ "backups": rows })),
+                )?;
+            }
+            Err((message, cause, action)) => {
+                reply_error(&mut stream, id, -32037, &message, &cause, &action)?;
             }
         },
         "db.status" => {
@@ -396,7 +408,7 @@ fn session(
                 reply_error(&mut stream, id, -32040, &message, &cause, &action)?;
             }
         },
-        "stack.stop" => match handle_stack_stop(stack, log) {
+        "stack.stop" => match handle_stack_stop(stack, &request, log) {
             Ok(status) => {
                 write_frame(&mut stream, &protocol_success(id, json!(status)))?;
             }
@@ -582,14 +594,70 @@ fn handle_db_start(
     }
 }
 
+fn parse_stop_options(request: &Value) -> Result<StopOptions, (String, String, String)> {
+    let without_backup = request
+        .pointer("/params/without_backup")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let system_shutdown = request
+        .pointer("/params/system_shutdown")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if without_backup {
+        let confirm = request
+            .pointer("/params/confirm")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if confirm != WITHOUT_BACKUP_CONFIRM {
+            return Err((
+                "confirmación de cierre sin copia inválida".into(),
+                format!("se esperaba escribir {WITHOUT_BACKUP_CONFIRM}"),
+                format!("hostig stop --without-backup y escribe {WITHOUT_BACKUP_CONFIRM}"),
+            ));
+        }
+    }
+    Ok(StopOptions {
+        without_backup,
+        system_shutdown,
+    })
+}
+
 fn handle_db_stop(
     db: &Arc<DbService>,
+    request: &Value,
     log: &Logger,
 ) -> Result<hostig_processes::mariadb::DbJobStatus, (String, String, String)> {
-    match db.stop_async() {
+    let options = parse_stop_options(request)?;
+    if options.without_backup {
+        log.info(
+            "backup",
+            "cierre sin copia (stop --without-backup confirmado)",
+        );
+    }
+    match db.stop_async_with(options) {
         Ok(status) => Ok(status),
         Err(error) => {
             log.error("processes", &error.message, &error.cause, &error.action);
+            Err((error.message, error.cause, error.action))
+        }
+    }
+}
+
+fn handle_db_backups(db: &DbService, log: &Logger) -> Result<Vec<Value>, (String, String, String)> {
+    match db.list_backups() {
+        Ok(entries) => Ok(entries
+            .into_iter()
+            .map(|e| {
+                json!({
+                    "schema": e.schema,
+                    "path": e.path.display().to_string(),
+                    "created_unix": e.created_unix,
+                    "size_bytes": e.size_bytes,
+                })
+            })
+            .collect()),
+        Err(error) => {
+            log.error("backup", &error.message, &error.cause, &error.action);
             Err((error.message, error.cause, error.action))
         }
     }
@@ -750,9 +818,17 @@ fn handle_stack_start(
 
 fn handle_stack_stop(
     stack: &Arc<StackService>,
+    request: &Value,
     log: &Logger,
 ) -> Result<hostig_processes::StackJobStatus, (String, String, String)> {
-    match stack.stop_async() {
+    let options = parse_stop_options(request)?;
+    if options.without_backup {
+        log.info(
+            "backup",
+            "cierre sin copia (stop --without-backup confirmado)",
+        );
+    }
+    match stack.stop_async_with(options) {
         Ok(status) => {
             log.info("processes", &format!("stack.stop job {}", status.job_id));
             Ok(status)
