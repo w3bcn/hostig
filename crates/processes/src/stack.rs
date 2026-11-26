@@ -1,8 +1,9 @@
 //! Orquestación MariaDB → PHP → Apache (ADR 0003).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use uuid::Uuid;
@@ -67,6 +68,41 @@ pub struct StackService {
     pub apache: Arc<ApacheService>,
     data_dir: std::path::PathBuf,
     inner: Mutex<Inner>,
+    /// Apagado del sistema en curso: no se aceptan arranques nuevos (ADR 0011).
+    closing: AtomicBool,
+}
+
+/// Tope duro de la parada rápida por apagado del sistema (ADR 0011).
+pub const SYSTEM_SHUTDOWN_BUDGET: Duration = Duration::from_secs(20);
+/// Espera máxima a Apache y a PHP en la parada rápida. Lo que sobra del tope es para MariaDB.
+const SYSTEM_SHUTDOWN_FRONT_STEP: Duration = Duration::from_secs(3);
+
+/// Resultado de un paso de la parada rápida.
+#[derive(Debug, Clone, Serialize)]
+pub struct SystemStopStep {
+    pub service: &'static str,
+    /// `false` si el servicio ya estaba parado y no se tocó.
+    pub attempted: bool,
+    pub elapsed_ms: u128,
+    pub error: Option<ProcessErrorJson>,
+}
+
+/// Informe de la parada rápida: tiempos por servicio y total.
+#[derive(Debug, Clone, Serialize)]
+pub struct SystemStopReport {
+    pub steps: Vec<SystemStopStep>,
+    pub total_ms: u128,
+    pub budget_ms: u128,
+}
+
+impl SystemStopReport {
+    /// MariaDB quedó parada (o no estaba en marcha) dentro del plazo.
+    pub fn mariadb_ok(&self) -> bool {
+        self.steps
+            .iter()
+            .find(|step| step.service == "mariadb")
+            .is_none_or(|step| step.error.is_none())
+    }
 }
 
 impl StackService {
@@ -84,6 +120,76 @@ impl StackService {
             inner: Mutex::new(Inner {
                 jobs: std::collections::HashMap::new(),
             }),
+            closing: AtomicBool::new(false),
+        }
+    }
+
+    /// Marca el apagado del sistema: a partir de aquí `start_async` falla.
+    pub fn begin_system_shutdown(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::SeqCst)
+    }
+
+    /// Parada rápida por apagado o cierre de sesión (ADR 0011).
+    ///
+    /// Síncrona: vuelve cuando MariaDB está parada o cuando vence `budget`.
+    /// Orden Apache → PHP → MariaDB, sin volcado. Apache y PHP tienen como mucho
+    /// unos segundos cada uno; si no paran a tiempo se sigue igualmente, porque lo
+    /// que no puede quedar a medias es la base. A MariaDB nunca se le hace
+    /// `TerminateProcess`: si vence el plazo, su parada ordenada sigue en segundo
+    /// plano y el informe lleva el error.
+    pub fn system_shutdown_stop(&self, budget: Duration) -> SystemStopReport {
+        self.begin_system_shutdown();
+        let started = Instant::now();
+        let deadline = started + budget;
+        let mut steps = Vec::with_capacity(3);
+
+        let apache_running = !matches!(
+            self.apache.status().state,
+            ApacheState::Stopped | ApacheState::Failed
+        );
+        steps.push(timed_step("apache", apache_running, || {
+            let job = self.apache.stop_async()?;
+            wait_apache_job(
+                &self.apache,
+                &job.job_id,
+                front_budget(deadline, SYSTEM_SHUTDOWN_FRONT_STEP),
+            )
+        }));
+
+        let php_running = !matches!(
+            self.php.status().state,
+            PhpState::Stopped | PhpState::Failed
+        );
+        steps.push(timed_step("php", php_running, || {
+            let job = self.php.stop_async()?;
+            wait_php_job(
+                &self.php,
+                &job.job_id,
+                front_budget(deadline, SYSTEM_SHUTDOWN_FRONT_STEP),
+            )
+        }));
+
+        let db_running = !matches!(self.db.status().state, DbState::Stopped | DbState::Failed);
+        steps.push(timed_step("mariadb", db_running, || {
+            let job = self.db.stop_async_with(crate::mariadb::StopOptions {
+                system_shutdown: true,
+                ..crate::mariadb::StopOptions::default()
+            })?;
+            wait_db_job(
+                &self.db,
+                &job.job_id,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+        }));
+
+        SystemStopReport {
+            steps,
+            total_ms: started.elapsed().as_millis(),
+            budget_ms: budget.as_millis(),
         }
     }
 
@@ -112,6 +218,9 @@ impl StackService {
     }
 
     pub fn start_async(self: &Arc<Self>, request: StackStartRequest) -> Result<StackJobStatus> {
+        if self.is_closing() {
+            return Err(closing_error());
+        }
         // Si el puerto HTTP ya está ocupado, no lanzar nada.
         if let Some(port) = request.http_port {
             match hostig_ports::check(port, None) {
@@ -312,6 +421,38 @@ impl StackService {
             wait_db_job(&self.db, &job.job_id, Duration::from_secs(60))?;
         }
         Ok(())
+    }
+}
+
+fn closing_error() -> ProcessError {
+    ProcessError::new(
+        "el sistema se está apagando",
+        "el supervisor está en la parada rápida del apagado o del cierre de sesión",
+        "vuelve a arrancar cuando el equipo se haya reiniciado",
+    )
+}
+
+/// Lo que queda hasta `deadline`, sin pasar de `cap`.
+fn front_budget(deadline: Instant, cap: Duration) -> Duration {
+    deadline.saturating_duration_since(Instant::now()).min(cap)
+}
+
+fn timed_step(
+    service: &'static str,
+    running: bool,
+    stop: impl FnOnce() -> Result<()>,
+) -> SystemStopStep {
+    let started = Instant::now();
+    let error = if running {
+        stop().err().map(|error| ProcessErrorJson::from(&error))
+    } else {
+        None
+    };
+    SystemStopStep {
+        service,
+        attempted: running,
+        elapsed_ms: started.elapsed().as_millis(),
+        error,
     }
 }
 
