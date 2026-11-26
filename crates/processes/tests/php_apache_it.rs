@@ -370,19 +370,26 @@ fn puerto_http_ocupado_no_lanza_nada() {
     }
     allow_job_for_tests();
     let tmp = data_dir();
-    let listener = TcpListener::bind(("127.0.0.1", 8080)).expect("hold 8080");
-    let _ = &listener;
+    // Otros tests de este binario arrancan Apache en 8080-8099 en paralelo: no se
+    // puede fijar 8080. Se ocupa el primer puerto libre del rango.
+    let (port, listener) = (8080u16..=8099)
+        .find_map(|port| {
+            TcpListener::bind(("127.0.0.1", port))
+                .ok()
+                .map(|listener| (port, listener))
+        })
+        .expect("ningún puerto libre en 8080-8099 para ocupar");
     thread::sleep(Duration::from_millis(50));
 
     let stack = make_stack(tmp.path());
     let err = stack
         .start_async(StackStartRequest {
-            http_port: Some(8080),
+            http_port: Some(port),
             ..StackStartRequest::default()
         })
         .expect_err("debe fallar");
     assert!(
-        err.message.contains("puerto HTTP ocupado") || err.cause.contains("8080"),
+        err.message.contains("puerto HTTP ocupado") || err.cause.contains(&port.to_string()),
         "{err:?}"
     );
     assert!(
