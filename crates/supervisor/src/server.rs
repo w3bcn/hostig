@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 
 use crate::lock::Lock;
 use crate::log::Logger;
+use crate::os_events;
 
 /// Tiempo máximo de inactividad por conexión (mensaje o cierre).
 const SESSION_IDLE: Duration = Duration::from_secs(5);
@@ -31,6 +32,15 @@ struct Services {
 }
 
 pub fn serve(layout: &Layout, log: &Logger, _lock: Lock) -> std::io::Result<()> {
+    // Antes de crear ningún hilo: en Unix, SIGTERM queda para el hilo de avisos.
+    if let Err(error) = os_events::prepare() {
+        log.error(
+            "apagado",
+            "no se pudo preparar la escucha de SIGTERM",
+            &error.to_string(),
+            "el apagado del sistema no tendrá parada rápida; usa hostig stop antes de apagar",
+        );
+    }
     let token = load_or_create_token(&layout.token_path)?;
     std::fs::write(layout.pid_path.as_path(), std::process::id().to_string())?;
     match clean_tmp_runtimes(&layout.data_dir) {
@@ -100,6 +110,20 @@ pub fn serve(layout: &Layout, log: &Logger, _lock: Lock) -> std::io::Result<()> 
         &format!("supervisor en marcha, pid {}", std::process::id()),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
+    let events = os_events::SystemEvents::new(
+        Arc::clone(&stack),
+        log.clone(),
+        Arc::clone(&shutdown),
+        layout.clone(),
+    );
+    if let Err(error) = os_events::install(events) {
+        log.error(
+            "apagado",
+            "no se pudo instalar la escucha del apagado del sistema",
+            &error.to_string(),
+            "el supervisor sigue en marcha; usa hostig stop antes de apagar el equipo",
+        );
+    }
     let active = Arc::new(AtomicUsize::new(0));
     let services = Services {
         runtimes,
@@ -249,7 +273,22 @@ fn session(
         reply_error(&mut stream, id, -32001, "testigo rechazado", cause, action)?;
         return wait_for_close_timed(&mut stream, log);
     }
-    match request_method(&request) {
+    let method = request_method(&request);
+    if stack.is_closing() && matches!(method, "db.start" | "stack.start") {
+        let cause = "el supervisor está en la parada rápida del apagado o del cierre de sesión";
+        let action = "vuelve a arrancar cuando el equipo se haya reiniciado";
+        log.error("apagado", "arranque rechazado", cause, action);
+        reply_error(
+            &mut stream,
+            id,
+            -32000,
+            "el sistema se está apagando",
+            cause,
+            action,
+        )?;
+        return wait_for_close_timed(&mut stream, log);
+    }
+    match method {
         "handshake" => {
             write_frame(&mut stream, &protocol_success(id, json!({ "ok": true })))?;
         }

@@ -1,5 +1,6 @@
 mod lock;
 mod log;
+mod os_events;
 mod server;
 
 use hostig_ipc::Layout;
