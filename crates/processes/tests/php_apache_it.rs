@@ -102,7 +102,7 @@ fn ensure_runtime(data: &Path, component: &str, version: &str) {
 fn ensure_stack_runtimes(data: &Path) {
     ensure_runtime(data, "mariadb", DEFAULT_MARIADB_VERSION);
     ensure_runtime(data, "php", DEFAULT_PHP_VERSION);
-    ensure_runtime(data, "apache", "2.4.70");
+    ensure_runtime(data, "apache", "2.4.71");
 }
 
 fn free_port() -> u16 {
